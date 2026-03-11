@@ -30,9 +30,10 @@ const config = {
   slackWebhookUrl: env.SLACK_WEBHOOK_URL,
   reconnectDelayMs: 5000,
   liveReconcileIntervalMs: Number.parseInt(env.LIVE_RECONCILE_INTERVAL_MS || "120000", 10),
+  authAlertIntervalMs: Number.parseInt(env.TWITCH_AUTH_ALERT_INTERVAL_MS || "7200000", 10),
 };
 
-const state = { broadcasters: {} };
+const state = { broadcasters: {}, meta: seedStateMeta() };
 const seenMessageIds = new Set();
 let websocket = null;
 let keepaliveTimer = null;
@@ -50,13 +51,18 @@ main().catch((error) => {
 
 async function main() {
   ensureStateDirectory(stateFile);
+  const initialState = loadState(stateFile, []);
+  state.broadcasters = initialState.broadcasters;
+  state.meta = initialState.meta;
   await ensureValidUserAccessToken();
   resolvedBroadcasters = await resolveBroadcasters(broadcasterLogins);
   if (resolvedBroadcasters.length === 0) {
     throw new Error("No broadcasters could be resolved from TWITCH_BROADCASTERS.");
   }
 
-  state.broadcasters = loadState(stateFile, resolvedBroadcasters).broadcasters;
+  const hydratedState = loadState(stateFile, resolvedBroadcasters);
+  state.broadcasters = hydratedState.broadcasters;
+  state.meta = hydratedState.meta;
   log("info", `Resolved ${resolvedBroadcasters.length} broadcasters`);
   await hydrateInitialState();
   await cleanupManagedSubscriptions();
@@ -252,6 +258,7 @@ async function ensureValidUserAccessToken() {
     throw new Error("TWITCH_ACCESS_TOKEN must be a User Access Token for EventSub WebSocket. App Access Tokens only work with webhook transport.");
   }
 
+  clearAuthFailureNotice();
   log("info", `Validated user token for ${validation.data.login}`);
 }
 
@@ -285,10 +292,14 @@ async function refreshUserAccessToken() {
 
     if (!response.ok) {
       const text = await response.text();
+      let refreshError;
       if (!config.twitchClientSecret && text.includes("missing client secret")) {
-        throw new Error("Failed to refresh TWITCH_ACCESS_TOKEN: Twitch requires TWITCH_CLIENT_SECRET for this app. Add TWITCH_CLIENT_SECRET to .env or recreate the token with a public Device Code client.");
+        refreshError = new Error("Failed to refresh TWITCH_ACCESS_TOKEN: Twitch requires TWITCH_CLIENT_SECRET for this app. Add TWITCH_CLIENT_SECRET to .env or recreate the token with a public Device Code client.");
+      } else {
+        refreshError = new Error(`Failed to refresh TWITCH_ACCESS_TOKEN: ${response.status} ${text}`);
       }
-      throw new Error(`Failed to refresh TWITCH_ACCESS_TOKEN: ${response.status} ${text}`);
+      await notifyAuthFailure(refreshError);
+      throw refreshError;
     }
 
     const token = await response.json();
@@ -302,6 +313,7 @@ async function refreshUserAccessToken() {
     process.env.TWITCH_REFRESH_TOKEN = token.refresh_token;
     saveEnvValue("TWITCH_ACCESS_TOKEN", token.access_token);
     saveEnvValue("TWITCH_REFRESH_TOKEN", token.refresh_token);
+    clearAuthFailureNotice();
     log("info", "Refreshed Twitch user access token");
   })();
 
@@ -688,22 +700,72 @@ function saveEnvValue(key, value) {
   fs.writeFileSync(envFilePath, updated.join("\n"));
 }
 
+async function notifyAuthFailure(error) {
+  const now = Date.now();
+  const authState = state.meta.auth.refreshFailure;
+  const detail = error instanceof Error ? error.message : String(error);
+
+  if (authState.lastNotifiedAt && now - authState.lastNotifiedAt < config.authAlertIntervalMs) {
+    log("warn", `Auth failure notification suppressed: nextAllowedInMs=${config.authAlertIntervalMs - (now - authState.lastNotifiedAt)}`);
+    return;
+  }
+
+  authState.lastNotifiedAt = now;
+  authState.lastError = detail;
+  saveState(stateFile, state);
+
+  try {
+    await postToSlack({
+      text: headline("Twitch auth refresh failed"),
+      blocks: [sectionBlock([
+        "*Twitch token refresh failed.*",
+        `*Time*: ${escapeMrkdwn(new Date(now).toISOString())}`,
+        `*Detail*: ${escapeMrkdwn(detail)}`,
+        `*Next Notification After*: ${escapeMrkdwn(new Date(now + config.authAlertIntervalMs).toISOString())}`,
+      ].join("\n"))],
+    });
+    log("warn", `Auth failure notification sent: ${detail}`);
+  } catch (notifyError) {
+    log("error", `Failed to send auth failure notification: ${notifyError instanceof Error ? notifyError.message : String(notifyError)}`);
+  }
+}
+
+function clearAuthFailureNotice() {
+  const authState = state.meta.auth.refreshFailure;
+  if (!authState.lastNotifiedAt && !authState.lastError) return;
+  authState.lastNotifiedAt = 0;
+  authState.lastError = "";
+  saveState(stateFile, state);
+}
 function parseBroadcasterLogins(value) {
   if (!value) return [];
   return [...new Set(value.split(",").map((item) => item.trim()).filter(Boolean))];
 }
 
 function loadState(filePath, broadcasters) {
-  if (!fs.existsSync(filePath)) return { broadcasters: seedBroadcasters(broadcasters) };
+  if (!fs.existsSync(filePath)) return { broadcasters: seedBroadcasters(broadcasters), meta: seedStateMeta() };
 
   const parsed = JSON.parse(fs.readFileSync(filePath, "utf8"));
   parsed.broadcasters ||= {};
+  parsed.meta ||= seedStateMeta();
+  parsed.meta.auth ||= seedStateMeta().auth;
+  parsed.meta.auth.refreshFailure ||= seedStateMeta().auth.refreshFailure;
   for (const broadcaster of broadcasters) {
     parsed.broadcasters[broadcaster.id] ||= seedBroadcaster(broadcaster);
   }
   return parsed;
 }
 
+function seedStateMeta() {
+  return {
+    auth: {
+      refreshFailure: {
+        lastNotifiedAt: 0,
+        lastError: "",
+      },
+    },
+  };
+}
 function seedBroadcasters(broadcasters) {
   const items = {};
   for (const broadcaster of broadcasters) items[broadcaster.id] = seedBroadcaster(broadcaster);
@@ -793,6 +855,7 @@ function escapeMrkdwn(text) {
 function log(level, message) {
   console.log(`${new Date().toISOString()} [${level}] ${message}`);
 }
+
 
 
 
