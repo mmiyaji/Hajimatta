@@ -53,10 +53,12 @@ SLACK_MESSAGE_MODE=aligned
 TWITCH_BROADCASTERS=erumdoor,kingofsimoyaka,foo,bar,baz
 STATE_FILE=./data/state.json
 LIVE_RECONCILE_INTERVAL_MS=120000
+LIVE_RECONCILE_LOG_MODE=changes
 TWITCH_AUTH_ALERT_INTERVAL_MS=7200000
 ```
 
 `LIVE_RECONCILE_INTERVAL_MS` ????????????? `120000` ? 2 ???? API ????????? 
+`LIVE_RECONCILE_LOG_MODE` は定期 API 補正ログの出し方です。`changes` がデフォルトで、状態変化があった周期だけ要約ログを出します。`verbose` は毎周期、`silent` は開始時ログも含めて抑止します。
 `SLACK_MESSAGE_MODE` は Slack の `text` と `blocks` の揃え方です。デフォルトの `aligned` はスマホ通知と本文をできるだけ一致させます。`legacy` にすると従来どおり `text` は短い見出し、本文は `blocks` になります。
 
 `TWITCH_BROADCASTERS` は Twitch の login 名のカンマ区切りです。起動時に `Get Users` API で user ID を自動解決します。

@@ -29,6 +29,7 @@ const config = {
   twitchRefreshToken: env.TWITCH_REFRESH_TOKEN || "",
   slackWebhookUrl: env.SLACK_WEBHOOK_URL,
   slackMessageMode: env.SLACK_MESSAGE_MODE || "aligned",
+  liveReconcileLogMode: env.LIVE_RECONCILE_LOG_MODE || "changes",
   reconnectDelayMs: 5000,
   liveReconcileIntervalMs: Number.parseInt(env.LIVE_RECONCILE_INTERVAL_MS || "120000", 10),
   authAlertIntervalMs: Number.parseInt(env.TWITCH_AUTH_ALERT_INTERVAL_MS || "7200000", 10),
@@ -471,7 +472,9 @@ async function hydrateInitialState() {
 }
 function startLiveReconcileLoop() {
   if (liveReconcileTimer) clearInterval(liveReconcileTimer);
-  log("info", `Starting live reconcile loop: intervalMs=${config.liveReconcileIntervalMs} intervalSec=${Math.round(config.liveReconcileIntervalMs / 1000)}`);
+  if (config.liveReconcileLogMode !== "silent") {
+    log("info", `Starting live reconcile loop: intervalMs=${config.liveReconcileIntervalMs} intervalSec=${Math.round(config.liveReconcileIntervalMs / 1000)} mode=${config.liveReconcileLogMode}`);
+  }
   liveReconcileTimer = setInterval(() => {
     reconcileLiveState().catch((error) => {
       log("error", error instanceof Error ? error.stack || error.message : String(error));
@@ -480,7 +483,9 @@ function startLiveReconcileLoop() {
 }
 
 async function reconcileLiveState() {
-  log("info", `Running live reconcile check for ${resolvedBroadcasters.length} broadcasters`);
+  if (config.liveReconcileLogMode === "verbose") {
+    log("info", `Running live reconcile check for ${resolvedBroadcasters.length} broadcasters`);
+  }
   const streams = await fetchLiveStreamsByLogin(resolvedBroadcasters.map((b) => b.login));
   const streamsByLogin = new Map(streams.map((stream) => [stream.user_login, stream]));
   let changed = false;
@@ -532,7 +537,9 @@ async function reconcileLiveState() {
   }
 
   if (changed) saveState(stateFile, state);
-  log("info", `Live reconcile completed: currentLive=${streams.length} reconciledOnline=${reconciledOnline} reconciledOffline=${reconciledOffline} changed=${changed}`);
+  if (config.liveReconcileLogMode === "verbose" || (config.liveReconcileLogMode === "changes" && changed)) {
+    log("info", `Live reconcile completed: currentLive=${streams.length} reconciledOnline=${reconciledOnline} reconciledOffline=${reconciledOffline} changed=${changed}`);
+  }
 }
 async function handleNotification(subscription, event) {
   switch (subscription.type) {
