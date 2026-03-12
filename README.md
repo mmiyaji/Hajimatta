@@ -49,13 +49,15 @@ TWITCH_CLIENT_SECRET=your_twitch_client_secret
 TWITCH_ACCESS_TOKEN=your_user_access_token
 TWITCH_REFRESH_TOKEN=your_refresh_token
 SLACK_WEBHOOK_URL=https://hooks.slack.com/services/XXX/YYY/ZZZ
+SLACK_MESSAGE_MODE=aligned
 TWITCH_BROADCASTERS=erumdoor,kingofsimoyaka,foo,bar,baz
 STATE_FILE=./data/state.json
 LIVE_RECONCILE_INTERVAL_MS=120000
 TWITCH_AUTH_ALERT_INTERVAL_MS=7200000
 ```
 
-`LIVE_RECONCILE_INTERVAL_MS` ????????????? `120000` ? 2 ???? API ?????????
+`LIVE_RECONCILE_INTERVAL_MS` ????????????? `120000` ? 2 ???? API ????????? 
+`SLACK_MESSAGE_MODE` は Slack の `text` と `blocks` の揃え方です。デフォルトの `aligned` はスマホ通知と本文をできるだけ一致させます。`legacy` にすると従来どおり `text` は短い見出し、本文は `blocks` になります。
 
 `TWITCH_BROADCASTERS` は Twitch の login 名のカンマ区切りです。起動時に `Get Users` API で user ID を自動解決します。
 

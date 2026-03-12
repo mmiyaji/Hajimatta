@@ -28,6 +28,7 @@ const config = {
   twitchAccessToken: env.TWITCH_ACCESS_TOKEN,
   twitchRefreshToken: env.TWITCH_REFRESH_TOKEN || "",
   slackWebhookUrl: env.SLACK_WEBHOOK_URL,
+  slackMessageMode: env.SLACK_MESSAGE_MODE || "aligned",
   reconnectDelayMs: 5000,
   liveReconcileIntervalMs: Number.parseInt(env.LIVE_RECONCILE_INTERVAL_MS || "120000", 10),
   authAlertIntervalMs: Number.parseInt(env.TWITCH_AUTH_ALERT_INTERVAL_MS || "7200000", 10),
@@ -502,16 +503,23 @@ async function reconcileLiveState() {
     }
 
     if (!liveStream && current.live) {
-      await postToSlack({
-        text: headline(`${displayNameOf(current)} stream ended (confirmed)`),
-        blocks: [sectionBlock([
+      await postToSlack(buildSlackPayload({
+        headlineText: `${displayNameOf(current)} stream ended (confirmed)`,
+        plainLines: [
+          `${displayNameOf(current)} stream end confirmed by API reconcile.`,
+          current.title ? `Title: ${current.title}` : null,
+          current.categoryName ? `Category: ${current.categoryName}` : null,
+          current.startedAt ? `Started At: ${current.startedAt}` : null,
+          `URL: ${streamUrl(current.login)}`,
+        ],
+        blockLines: [
           `*${displayNameOf(current)}* stream end confirmed by API reconcile.`,
           current.title ? `*Title*: ${escapeMrkdwn(current.title)}` : null,
           current.categoryName ? `*Category*: ${escapeMrkdwn(current.categoryName)}` : null,
           current.startedAt ? `*Started At*: ${escapeMrkdwn(current.startedAt)}` : null,
           `*URL*: ${streamUrl(current.login)}`,
-        ].filter(Boolean).join("\n"))],
-      });
+        ],
+      }));
 
       current.live = false;
       current.startedAt = null;
@@ -547,12 +555,19 @@ async function handleStreamOnline(event) {
   saveState(stateFile, state);
 
   await postToSlack({
-    text: headline(`${displayNameOf(broadcaster)} started streaming`),
-    blocks: [sectionBlock([
-      `*${displayNameOf(broadcaster)}* が配信を開始しました。`,
-      broadcaster.startedAt ? `*開始時刻*: ${escapeMrkdwn(broadcaster.startedAt)}` : null,
-      `*URL*: ${streamUrl(broadcaster.login)}`,
-    ].filter(Boolean).join("\n"))],
+    ...buildSlackPayload({
+      headlineText: `${displayNameOf(broadcaster)} started streaming`,
+      plainLines: [
+        `${displayNameOf(broadcaster)} が配信を開始しました。`,
+        broadcaster.startedAt ? `開始時刻: ${broadcaster.startedAt}` : null,
+        `URL: ${streamUrl(broadcaster.login)}`,
+      ],
+      blockLines: [
+        `*${displayNameOf(broadcaster)}* が配信を開始しました。`,
+        broadcaster.startedAt ? `*開始時刻*: ${escapeMrkdwn(broadcaster.startedAt)}` : null,
+        `*URL*: ${streamUrl(broadcaster.login)}`,
+      ],
+    }),
   });
 
   log("info", `Stream online detected: login=${broadcaster.login} title=${broadcaster.title || "(unknown)"} category=${broadcaster.categoryName || "(unknown)"} url=${streamUrl(broadcaster.login)}`);
@@ -578,15 +593,21 @@ async function handleChannelUpdate(event) {
       return;
     }
 
-    await postToSlack({
-      text: headline(`${displayNameOf(broadcaster)} stream prep detected`),
-      blocks: [sectionBlock([
-        `*${displayNameOf(broadcaster)}* ??????????????????`,
-        titleChangedWhileOffline ? `*????*: ${escapeMrkdwn(previousTitle || "(empty)")} -> ${escapeMrkdwn(broadcaster.title || "(empty)")}` : null,
-        categoryChangedWhileOffline ? `*?????*: ${escapeMrkdwn(previousCategory || "(empty)")} -> ${escapeMrkdwn(broadcaster.categoryName || "(empty)")}` : null,
+    await postToSlack(buildSlackPayload({
+      headlineText: `${displayNameOf(broadcaster)} stream prep detected`,
+      plainLines: [
+        `${displayNameOf(broadcaster)} が配信準備を始めた可能性があります。`,
+        titleChangedWhileOffline ? `タイトル: ${previousTitle || "(empty)"} -> ${broadcaster.title || "(empty)"}` : null,
+        categoryChangedWhileOffline ? `カテゴリー: ${previousCategory || "(empty)"} -> ${broadcaster.categoryName || "(empty)"}` : null,
+        `URL: ${streamUrl(broadcaster.login)}`,
+      ],
+      blockLines: [
+        `*${displayNameOf(broadcaster)}* が配信準備を始めた可能性があります。`,
+        titleChangedWhileOffline ? `*タイトル*: ${escapeMrkdwn(previousTitle || "(empty)")} -> ${escapeMrkdwn(broadcaster.title || "(empty)")}` : null,
+        categoryChangedWhileOffline ? `*カテゴリー*: ${escapeMrkdwn(previousCategory || "(empty)")} -> ${escapeMrkdwn(broadcaster.categoryName || "(empty)")}` : null,
         `*URL*: ${streamUrl(broadcaster.login)}`,
-      ].filter(Boolean).join("\n"))],
-    });
+      ],
+    }));
 
     log("info", `Pre-stream update detected: login=${broadcaster.login} title=${broadcaster.title || "(empty)"} category=${broadcaster.categoryName || "(empty)"} url=${streamUrl(broadcaster.login)}`);
     return;
@@ -596,15 +617,21 @@ async function handleChannelUpdate(event) {
     broadcaster.initialUpdateNotified = true;
     saveState(stateFile, state);
 
-    await postToSlack({
-      text: headline(`${displayNameOf(broadcaster)} stream details updated`),
-      blocks: [sectionBlock([
+    await postToSlack(buildSlackPayload({
+      headlineText: `${displayNameOf(broadcaster)} stream details updated`,
+      plainLines: [
+        `${displayNameOf(broadcaster)} の配信情報を受信しました。`,
+        broadcaster.title ? `タイトル: ${broadcaster.title}` : null,
+        broadcaster.categoryName ? `カテゴリー: ${broadcaster.categoryName}` : null,
+        `URL: ${streamUrl(broadcaster.login)}`,
+      ],
+      blockLines: [
         `*${displayNameOf(broadcaster)}* の配信情報を受信しました。`,
         broadcaster.title ? `*タイトル*: ${escapeMrkdwn(broadcaster.title)}` : null,
         broadcaster.categoryName ? `*カテゴリー*: ${escapeMrkdwn(broadcaster.categoryName)}` : null,
         `*URL*: ${streamUrl(broadcaster.login)}`,
-      ].filter(Boolean).join("\n"))],
-    });
+      ],
+    }));
 
     log("info", `Initial channel update notified: login=${broadcaster.login} title=${broadcaster.title || "(empty)"} category=${broadcaster.categoryName || "(empty)"} url=${streamUrl(broadcaster.login)}`);
     return;
@@ -614,15 +641,21 @@ async function handleChannelUpdate(event) {
   const categoryChanged = previousCategory !== broadcaster.categoryName;
   if (!titleChanged && !categoryChanged) return;
 
-  await postToSlack({
-    text: headline(`${displayNameOf(broadcaster)} updated stream settings`),
-    blocks: [sectionBlock([
+  await postToSlack(buildSlackPayload({
+    headlineText: `${displayNameOf(broadcaster)} updated stream settings`,
+    plainLines: [
+      `${displayNameOf(broadcaster)} の配信情報が更新されました。`,
+      titleChanged ? `タイトル: ${previousTitle || "(empty)"} -> ${broadcaster.title || "(empty)"}` : null,
+      categoryChanged ? `カテゴリー: ${previousCategory || "(empty)"} -> ${broadcaster.categoryName || "(empty)"}` : null,
+      `URL: ${streamUrl(broadcaster.login)}`,
+    ],
+    blockLines: [
       `*${displayNameOf(broadcaster)}* の配信情報が更新されました。`,
       titleChanged ? `*タイトル*: ${escapeMrkdwn(previousTitle || "(empty)")} -> ${escapeMrkdwn(broadcaster.title || "(empty)")}` : null,
       categoryChanged ? `*カテゴリー*: ${escapeMrkdwn(previousCategory || "(empty)")} -> ${escapeMrkdwn(broadcaster.categoryName || "(empty)")}` : null,
       `*URL*: ${streamUrl(broadcaster.login)}`,
-    ].filter(Boolean).join("\n"))],
-  });
+    ],
+  }));
 
   log("info", `Channel update notified: login=${broadcaster.login} title=${broadcaster.title || "(empty)"} category=${broadcaster.categoryName || "(empty)"} url=${streamUrl(broadcaster.login)}`);
 }
@@ -637,6 +670,18 @@ async function postToSlack(payload) {
     const text = await response.text();
     throw new Error(`Slack webhook failed: ${response.status} ${text}`);
   }
+}
+
+function buildSlackPayload({ headlineText, plainLines, blockLines }) {
+  const normalizedPlainLines = plainLines.filter(Boolean);
+  const normalizedBlockLines = blockLines.filter(Boolean);
+  const alignedText = [headline(headlineText), ...normalizedPlainLines].join("\n");
+  const legacyText = headline(headlineText);
+
+  return {
+    text: config.slackMessageMode === "legacy" ? legacyText : alignedText,
+    blocks: [sectionBlock(normalizedBlockLines.join("\n"))],
+  };
 }
 
 function ensureBroadcasterState(event) {
@@ -716,13 +761,21 @@ async function notifyAuthFailure(error) {
 
   try {
     await postToSlack({
-      text: headline("Twitch auth refresh failed"),
-      blocks: [sectionBlock([
-        "*Twitch token refresh failed.*",
-        `*Time*: ${escapeMrkdwn(new Date(now).toISOString())}`,
-        `*Detail*: ${escapeMrkdwn(detail)}`,
-        `*Next Notification After*: ${escapeMrkdwn(new Date(now + config.authAlertIntervalMs).toISOString())}`,
-      ].join("\n"))],
+      ...buildSlackPayload({
+        headlineText: "Twitch auth refresh failed",
+        plainLines: [
+          "Twitch token refresh failed.",
+          `Time: ${new Date(now).toISOString()}`,
+          `Detail: ${detail}`,
+          `Next Notification After: ${new Date(now + config.authAlertIntervalMs).toISOString()}`,
+        ],
+        blockLines: [
+          "*Twitch token refresh failed.*",
+          `*Time*: ${escapeMrkdwn(new Date(now).toISOString())}`,
+          `*Detail*: ${escapeMrkdwn(detail)}`,
+          `*Next Notification After*: ${escapeMrkdwn(new Date(now + config.authAlertIntervalMs).toISOString())}`,
+        ],
+      }),
     });
     log("warn", `Auth failure notification sent: ${detail}`);
   } catch (notifyError) {
