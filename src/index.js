@@ -43,8 +43,9 @@ let keepaliveTimeoutSeconds = 10;
 let reconnectTimer = null;
 let refreshInFlight = null;
 let resolvedBroadcasters = [];
-let intentionalClose = false;
 let liveReconcileTimer = null;
+const intentionallyClosingSockets = new WeakSet();
+let eventsubReady = false;
 
 main().catch((error) => {
   log("fatal", error instanceof Error ? error.stack || error.message : String(error));
@@ -100,8 +101,8 @@ async function connect(url) {
     if (socket !== websocket) return;
     log("warn", "WebSocket closed");
     clearKeepaliveTimer();
-    if (intentionalClose) {
-      intentionalClose = false;
+    if (intentionallyClosingSockets.has(socket)) {
+      intentionallyClosingSockets.delete(socket);
       return;
     }
     scheduleReconnect();
@@ -163,6 +164,8 @@ async function registerSubscriptions(sessionId) {
       await createSubscription(type, broadcaster.id, sessionId);
     }
   }
+
+  eventsubReady = true;
 }
 
 async function cleanupManagedSubscriptions() {
@@ -235,9 +238,11 @@ async function reconnectTo(url) {
   log("info", `Reconnect requested by Twitch: ${url}`);
   clearKeepaliveTimer();
   const previousSocket = websocket;
-  intentionalClose = true;
   await connect(url);
-  if (previousSocket && previousSocket !== websocket) previousSocket.close();
+  if (previousSocket && previousSocket !== websocket) {
+    intentionallyClosingSockets.add(previousSocket);
+    previousSocket.close();
+  }
 }
 async function ensureValidUserAccessToken() {
   let validation = await validateUserAccessToken();
@@ -363,7 +368,12 @@ async function resolveBroadcasters(logins) {
 
     const json = await response.json();
     for (const user of json.data || []) {
-      resolved.push({ id: user.id, login: user.login, displayName: user.display_name });
+      resolved.push({
+        id: user.id,
+        login: user.login,
+        displayName: user.display_name,
+        profileImageUrl: user.profile_image_url || "",
+      });
     }
   }
 
@@ -503,6 +513,24 @@ async function reconcileLiveState() {
       state.broadcasters[broadcaster.id] = current;
       changed = true;
       reconciledOnline += 1;
+      if (eventsubReady) {
+        await postToSlack({
+          ...buildSlackPayload({
+            headlineText: `${displayNameOf(current)} started streaming`,
+            iconUrl: current.profileImageUrl,
+            plainLines: [
+              `${displayNameOf(current)} が配信を開始しました。`,
+              current.startedAt ? `開始時刻: ${current.startedAt}` : null,
+              `URL: ${streamUrl(current.login)}`,
+            ],
+            blockLines: [
+              `*${displayNameOf(current)}* が配信を開始しました。`,
+              current.startedAt ? `*開始時刻*: ${escapeMrkdwn(current.startedAt)}` : null,
+              `*URL*: ${streamUrl(current.login)}`,
+            ],
+          }),
+        });
+      }
       log("info", `Live state reconciled online: login=${broadcaster.login} startedAt=${current.startedAt || "(unknown)"} url=${streamUrl(broadcaster.login)}`);
       continue;
     }
@@ -510,6 +538,7 @@ async function reconcileLiveState() {
     if (!liveStream && current.live) {
       await postToSlack(buildSlackPayload({
         headlineText: `${displayNameOf(current)} stream ended (confirmed)`,
+        iconUrl: current.profileImageUrl,
         plainLines: [
           `${displayNameOf(current)} stream end confirmed by API reconcile.`,
           current.title ? `Title: ${current.title}` : null,
@@ -564,6 +593,7 @@ async function handleStreamOnline(event) {
   await postToSlack({
     ...buildSlackPayload({
       headlineText: `${displayNameOf(broadcaster)} started streaming`,
+      iconUrl: broadcaster.profileImageUrl,
       plainLines: [
         `${displayNameOf(broadcaster)} が配信を開始しました。`,
         broadcaster.startedAt ? `開始時刻: ${broadcaster.startedAt}` : null,
@@ -602,6 +632,7 @@ async function handleChannelUpdate(event) {
 
     await postToSlack(buildSlackPayload({
       headlineText: `${displayNameOf(broadcaster)} stream prep detected`,
+      iconUrl: broadcaster.profileImageUrl,
       plainLines: [
         `${displayNameOf(broadcaster)} が配信準備を始めた可能性があります。`,
         titleChangedWhileOffline ? `タイトル: ${previousTitle || "(empty)"} -> ${broadcaster.title || "(empty)"}` : null,
@@ -626,6 +657,7 @@ async function handleChannelUpdate(event) {
 
     await postToSlack(buildSlackPayload({
       headlineText: `${displayNameOf(broadcaster)} stream details updated`,
+      iconUrl: broadcaster.profileImageUrl,
       plainLines: [
         `${displayNameOf(broadcaster)} の配信情報を受信しました。`,
         broadcaster.title ? `タイトル: ${broadcaster.title}` : null,
@@ -650,6 +682,7 @@ async function handleChannelUpdate(event) {
 
   await postToSlack(buildSlackPayload({
     headlineText: `${displayNameOf(broadcaster)} updated stream settings`,
+    iconUrl: broadcaster.profileImageUrl,
     plainLines: [
       `${displayNameOf(broadcaster)} の配信情報が更新されました。`,
       titleChanged ? `タイトル: ${previousTitle || "(empty)"} -> ${broadcaster.title || "(empty)"}` : null,
@@ -679,15 +712,16 @@ async function postToSlack(payload) {
   }
 }
 
-function buildSlackPayload({ headlineText, plainLines, blockLines }) {
+function buildSlackPayload({ headlineText, plainLines, blockLines, iconUrl }) {
   const normalizedPlainLines = plainLines.filter(Boolean);
   const normalizedBlockLines = blockLines.filter(Boolean);
   const alignedText = [headline(headlineText), ...normalizedPlainLines].join("\n");
   const legacyText = headline(headlineText);
+  const section = sectionBlock(normalizedBlockLines.join("\n"), iconUrl);
 
   return {
     text: config.slackMessageMode === "legacy" ? legacyText : alignedText,
-    blocks: [sectionBlock(normalizedBlockLines.join("\n"))],
+    blocks: [section],
   };
 }
 
@@ -701,6 +735,7 @@ function ensureBroadcasterState(event) {
   broadcaster.id = event.broadcaster_user_id;
   broadcaster.login = event.broadcaster_user_login;
   broadcaster.displayName = event.broadcaster_user_name;
+  broadcaster.profileImageUrl = broadcaster.profileImageUrl ?? "";
   broadcaster.title = broadcaster.title ?? "";
   broadcaster.categoryId = broadcaster.categoryId ?? "";
   broadcaster.categoryName = broadcaster.categoryName ?? "";
@@ -837,6 +872,7 @@ function seedBroadcaster(broadcaster) {
     id: broadcaster.id,
     login: broadcaster.login,
     displayName: broadcaster.displayName || broadcaster.login,
+    profileImageUrl: broadcaster.profileImageUrl || "",
     title: "",
     categoryId: "",
     categoryName: "",
@@ -900,8 +936,16 @@ function streamUrl(login) {
   return `https://www.twitch.tv/${login}`;
 }
 
-function sectionBlock(text) {
-  return { type: "section", text: { type: "mrkdwn", text } };
+function sectionBlock(text, imageUrl) {
+  const block = { type: "section", text: { type: "mrkdwn", text } };
+  if (imageUrl) {
+    block.accessory = {
+      type: "image",
+      image_url: imageUrl,
+      alt_text: "twitch profile image",
+    };
+  }
+  return block;
 }
 
 function headline(text) {
