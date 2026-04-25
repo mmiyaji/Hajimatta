@@ -635,14 +635,14 @@ async function handleChannelUpdate(event) {
       iconUrl: broadcaster.profileImageUrl,
       plainLines: [
         `${displayNameOf(broadcaster)} が配信準備を始めた可能性があります。`,
-        titleChangedWhileOffline ? `タイトル: ${previousTitle || "(empty)"} -> ${broadcaster.title || "(empty)"}` : null,
-        categoryChangedWhileOffline ? `カテゴリー: ${previousCategory || "(empty)"} -> ${broadcaster.categoryName || "(empty)"}` : null,
+        titleChangedWhileOffline ? `タイトル: ${broadcaster.title || "(empty)"} <- ${previousTitle || "(empty)"}` : null,
+        categoryChangedWhileOffline ? `カテゴリー: ${broadcaster.categoryName || "(empty)"} <- ${previousCategory || "(empty)"}` : null,
         `URL: ${streamUrl(broadcaster.login)}`,
       ],
       blockLines: [
         `*${displayNameOf(broadcaster)}* が配信準備を始めた可能性があります。`,
-        titleChangedWhileOffline ? `*タイトル*: ${escapeMrkdwn(previousTitle || "(empty)")} -> ${escapeMrkdwn(broadcaster.title || "(empty)")}` : null,
-        categoryChangedWhileOffline ? `*カテゴリー*: ${escapeMrkdwn(previousCategory || "(empty)")} -> ${escapeMrkdwn(broadcaster.categoryName || "(empty)")}` : null,
+        titleChangedWhileOffline ? `*タイトル*: ${escapeMrkdwn(broadcaster.title || "(empty)")} <- ${escapeMrkdwn(previousTitle || "(empty)")}` : null,
+        categoryChangedWhileOffline ? `*カテゴリー*: ${escapeMrkdwn(broadcaster.categoryName || "(empty)")} <- ${escapeMrkdwn(previousCategory || "(empty)")}` : null,
         `*URL*: ${streamUrl(broadcaster.login)}`,
       ],
     }));
@@ -685,14 +685,14 @@ async function handleChannelUpdate(event) {
     iconUrl: broadcaster.profileImageUrl,
     plainLines: [
       `${displayNameOf(broadcaster)} の配信情報が更新されました。`,
-      titleChanged ? `タイトル: ${previousTitle || "(empty)"} -> ${broadcaster.title || "(empty)"}` : null,
-      categoryChanged ? `カテゴリー: ${previousCategory || "(empty)"} -> ${broadcaster.categoryName || "(empty)"}` : null,
+      titleChanged ? `タイトル: ${broadcaster.title || "(empty)"} <- ${previousTitle || "(empty)"}` : null,
+      categoryChanged ? `カテゴリー: ${broadcaster.categoryName || "(empty)"} <- ${previousCategory || "(empty)"}` : null,
       `URL: ${streamUrl(broadcaster.login)}`,
     ],
     blockLines: [
       `*${displayNameOf(broadcaster)}* の配信情報が更新されました。`,
-      titleChanged ? `*タイトル*: ${escapeMrkdwn(previousTitle || "(empty)")} -> ${escapeMrkdwn(broadcaster.title || "(empty)")}` : null,
-      categoryChanged ? `*カテゴリー*: ${escapeMrkdwn(previousCategory || "(empty)")} -> ${escapeMrkdwn(broadcaster.categoryName || "(empty)")}` : null,
+      titleChanged ? `*タイトル*: ${escapeMrkdwn(broadcaster.title || "(empty)")} <- ${escapeMrkdwn(previousTitle || "(empty)")}` : null,
+      categoryChanged ? `*カテゴリー*: ${escapeMrkdwn(broadcaster.categoryName || "(empty)")} <- ${escapeMrkdwn(previousCategory || "(empty)")}` : null,
       `*URL*: ${streamUrl(broadcaster.login)}`,
     ],
   }));
