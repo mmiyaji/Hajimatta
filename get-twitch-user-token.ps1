@@ -1,6 +1,7 @@
 param(
   [Parameter(Mandatory = $true)]
-  [string]$ClientId
+  [string]$ClientId,
+  [string]$Scopes = "user:read:chat"
 )
 
 $device = Invoke-RestMethod `
@@ -9,7 +10,7 @@ $device = Invoke-RestMethod `
   -ContentType "application/x-www-form-urlencoded" `
   -Body @{
     client_id = $ClientId
-    scopes    = ""
+    scopes    = $Scopes
   }
 
 Write-Host ""
@@ -27,7 +28,7 @@ $token = Invoke-RestMethod `
   -ContentType "application/x-www-form-urlencoded" `
   -Body @{
     client_id   = $ClientId
-    scopes      = ""
+    scopes      = $Scopes
     device_code = $device.device_code
     grant_type  = "urn:ietf:params:oauth:grant-type:device_code"
   }

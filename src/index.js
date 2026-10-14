@@ -2,13 +2,17 @@
 const WebSocket = require("ws");
 const fs = require("node:fs");
 const path = require("node:path");
+const { chatSettingsChanges } = require("./chat-settings");
 
 const EVENTSUB_WS_URL = "wss://eventsub.wss.twitch.tv/ws";
 const TWITCH_API_BASE_URL = "https://api.twitch.tv/helix";
 const TWITCH_VALIDATE_URL = "https://id.twitch.tv/oauth2/validate";
 const TWITCH_TOKEN_URL = "https://id.twitch.tv/oauth2/token";
 const SUBSCRIPTION_TYPES = ["stream.online", "channel.update"];
+const CHAT_SETTINGS_TYPE = "channel.chat_settings.update";
 const MAX_BROADCASTERS = 5;
+const WS_CONNECT_TIMEOUT_MS = 15000;
+const WS_SETUP_TIMEOUT_MS = 30000;
 
 const env = loadEnv();
 const broadcasterLogins = parseBroadcasterLogins(env.TWITCH_BROADCASTERS);
@@ -44,8 +48,8 @@ let reconnectTimer = null;
 let refreshInFlight = null;
 let resolvedBroadcasters = [];
 let liveReconcileTimer = null;
-const intentionallyClosingSockets = new WeakSet();
 let eventsubReady = false;
+let chatUserId = null;
 
 main().catch((error) => {
   log("fatal", error instanceof Error ? error.stack || error.message : String(error));
@@ -73,13 +77,28 @@ async function main() {
   startLiveReconcileLoop();
 }
 
-async function connect(url) {
+async function connect(url, previousSocket = null) {
   clearTimeout(reconnectTimer);
   reconnectTimer = null;
 
-  log("info", `Connecting to Twitch EventSub: ${url}`);
-  const socket = new WebSocket(url);
+  log("info", `Connecting to Twitch EventSub${previousSocket ? " (session transfer)" : ""}`);
+  clearKeepaliveTimer();
+  const socket = new WebSocket(url, { handshakeTimeout: WS_CONNECT_TIMEOUT_MS });
   websocket = socket;
+  let welcomed = false;
+  const failConnection = (reason) => {
+    if (socket !== websocket) return;
+    log("warn", reason);
+    clearTimeout(setupTimer);
+    clearKeepaliveTimer();
+    websocket = null;
+    socket.terminate();
+    if (previousSocket) previousSocket.terminate();
+    scheduleReconnect();
+  };
+  const setupTimer = setTimeout(() => {
+    failConnection("WebSocket setup timed out; retrying connection");
+  }, WS_SETUP_TIMEOUT_MS);
 
   socket.on("open", () => {
     if (socket !== websocket) return;
@@ -87,41 +106,63 @@ async function connect(url) {
   });
 
   socket.on("message", async (data) => {
-    if (socket !== websocket) return;
+    if (socket !== websocket && websocket?.previousSocket !== socket) return;
 
     try {
       const payload = JSON.parse(String(data));
-      await handleMessage(payload);
+      if (socket !== websocket) {
+        if (payload.metadata?.message_type === "notification") await handleMessage(payload, socket);
+        return;
+      }
+      if (payload.metadata?.message_type === "session_welcome") {
+        if (welcomed) return;
+        welcomed = true;
+        if (previousSocket) {
+          socket.previousSocket = null;
+          previousSocket.close();
+        }
+        await handleMessage(payload, socket, Boolean(previousSocket));
+        if (socket !== websocket) return;
+        clearTimeout(setupTimer);
+        log("info", "EventSub session ready");
+      } else {
+        await handleMessage(payload, socket);
+      }
     } catch (error) {
       log("error", error instanceof Error ? error.stack || error.message : String(error));
+      if (!welcomed || !socket.subscriptionsReady) failConnection("EventSub setup failed; retrying connection");
     }
   });
 
-  socket.on("close", () => {
+  socket.previousSocket = previousSocket;
+  socket.on("close", (code, reason) => {
+    clearTimeout(setupTimer);
     if (socket !== websocket) return;
-    log("warn", "WebSocket closed");
+    log("warn", `WebSocket closed: code=${code} reason=${String(reason) || "(none)"}`);
     clearKeepaliveTimer();
-    if (intentionallyClosingSockets.has(socket)) {
-      intentionallyClosingSockets.delete(socket);
-      return;
-    }
+    websocket = null;
+    if (previousSocket) previousSocket.terminate();
     scheduleReconnect();
   });
 
   socket.on("error", (error) => {
     if (socket !== websocket) return;
     log("error", error?.message || "WebSocket error");
+    failConnection("WebSocket error; retrying connection");
   });
 }
 
-async function handleMessage(payload) {
+async function handleMessage(payload, socket = websocket, transferred = false) {
   const metadata = payload.metadata || {};
   const messageType = metadata.message_type;
   const messageId = metadata.message_id;
   const keepaliveSeconds = payload.payload?.session?.keepalive_timeout_seconds;
 
-  if (keepaliveSeconds) {
+  if (socket === websocket && keepaliveSeconds) {
     keepaliveTimeoutSeconds = keepaliveSeconds;
+    resetKeepaliveTimeout(keepaliveTimeoutSeconds);
+  }
+  if (socket === websocket && (messageType === "notification" || messageType === "session_keepalive")) {
     resetKeepaliveTimeout(keepaliveTimeoutSeconds);
   }
 
@@ -136,7 +177,9 @@ async function handleMessage(payload) {
 
   switch (messageType) {
     case "session_welcome":
-      await registerSubscriptions(payload.payload.session.id);
+      resetKeepaliveTimeout(keepaliveTimeoutSeconds);
+      if (!transferred) await registerSubscriptions(payload.payload.session.id, socket);
+      if (socket === websocket) socket.subscriptionsReady = true;
       return;
     case "session_keepalive":
       resetKeepaliveTimeout(keepaliveTimeoutSeconds);
@@ -155,17 +198,30 @@ async function handleMessage(payload) {
   }
 }
 
-async function registerSubscriptions(sessionId) {
-  const total = resolvedBroadcasters.length * SUBSCRIPTION_TYPES.length;
+async function registerSubscriptions(sessionId, socket = websocket) {
+  const total = resolvedBroadcasters.length * (SUBSCRIPTION_TYPES.length + (chatUserId ? 1 : 0));
   log("info", `Registering ${total} subscriptions on session ${sessionId}`);
 
   for (const broadcaster of resolvedBroadcasters) {
     for (const type of SUBSCRIPTION_TYPES) {
+      if (socket !== websocket) return;
       await createSubscription(type, broadcaster.id, sessionId);
     }
   }
 
-  eventsubReady = true;
+  if (chatUserId) {
+    for (const broadcaster of resolvedBroadcasters) {
+      if (socket !== websocket) return;
+      try {
+        await createSubscription(CHAT_SETTINGS_TYPE, broadcaster.id, sessionId);
+      } catch (error) {
+        log("warn", `Chat settings subscription failed for ${broadcaster.login}: ${error.message}`);
+        throw error;
+      }
+    }
+  }
+
+  if (socket === websocket) eventsubReady = true;
 }
 
 async function cleanupManagedSubscriptions() {
@@ -182,7 +238,7 @@ async function cleanupManagedSubscriptions() {
 
   const payload = await response.json();
   const subscriptions = payload.data || [];
-  const managedTypes = new Set(SUBSCRIPTION_TYPES);
+  const managedTypes = new Set([...SUBSCRIPTION_TYPES, CHAT_SETTINGS_TYPE]);
   const managedBroadcasterIds = new Set(resolvedBroadcasters.map((b) => b.id));
 
   for (const subscription of subscriptions) {
@@ -214,7 +270,10 @@ async function createSubscription(type, broadcasterUserId, sessionId) {
       body: JSON.stringify({
         type,
         version: "1",
-        condition: { broadcaster_user_id: broadcasterUserId },
+        condition: {
+          broadcaster_user_id: broadcasterUserId,
+          ...(type === CHAT_SETTINGS_TYPE ? { user_id: chatUserId } : {}),
+        },
         transport: { method: "websocket", session_id: sessionId },
       }),
     },
@@ -235,14 +294,10 @@ async function createSubscription(type, broadcasterUserId, sessionId) {
 }
 
 async function reconnectTo(url) {
-  log("info", `Reconnect requested by Twitch: ${url}`);
+  log("info", "Reconnect requested by Twitch");
   clearKeepaliveTimer();
   const previousSocket = websocket;
-  await connect(url);
-  if (previousSocket && previousSocket !== websocket) {
-    intentionallyClosingSockets.add(previousSocket);
-    previousSocket.close();
-  }
+  await connect(url, previousSocket);
 }
 async function ensureValidUserAccessToken() {
   let validation = await validateUserAccessToken();
@@ -266,6 +321,8 @@ async function ensureValidUserAccessToken() {
   }
 
   clearAuthFailureNotice();
+  chatUserId = validation.data.scopes?.includes("user:read:chat") ? validation.data.user_id : null;
+  if (!chatUserId) log("warn", "Chat mode notifications disabled: reauthorize token with user:read:chat scope");
   log("info", `Validated user token for ${validation.data.login}`);
 }
 
@@ -578,9 +635,28 @@ async function handleNotification(subscription, event) {
     case "channel.update":
       await handleChannelUpdate(event);
       return;
+    case CHAT_SETTINGS_TYPE:
+      await handleChatSettingsUpdate(event);
+      return;
     default:
       log("info", `Ignored event: ${subscription.type}`);
   }
+}
+
+async function handleChatSettingsUpdate(event) {
+  const broadcaster = ensureBroadcasterState(event);
+  const changes = chatSettingsChanges(broadcaster.chatSettings, event);
+  if (changes.length) {
+    await postToSlack(buildSlackPayload({
+      headlineText: `${displayNameOf(broadcaster)} chat mode updated`,
+      iconUrl: broadcaster.profileImageUrl,
+      plainLines: [`${displayNameOf(broadcaster)} のチャット設定が更新されました。`, ...changes, `URL: ${streamUrl(broadcaster.login)}`],
+      blockLines: [`*${escapeMrkdwn(displayNameOf(broadcaster))}* のチャット設定が更新されました。`, ...changes.map(escapeMrkdwn), `*URL*: ${streamUrl(broadcaster.login)}`],
+    }));
+    log("info", `Chat mode updated: login=${broadcaster.login} ${changes.join("; ")}`);
+  }
+  broadcaster.chatSettings = { ...event };
+  saveState(stateFile, state);
 }
 
 async function handleStreamOnline(event) {
@@ -905,7 +981,7 @@ function resetKeepaliveTimeout(keepaliveTimeoutSeconds) {
   const timeoutMs = Math.max((keepaliveTimeoutSeconds + 20) * 1000, 60000);
   keepaliveTimer = setTimeout(() => {
     log("warn", "Keepalive timeout reached; closing socket");
-    if (websocket) websocket.close();
+    if (websocket) websocket.terminate();
   }, timeoutMs);
 }
 

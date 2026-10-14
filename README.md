@@ -41,6 +41,30 @@ Twitch EventSub WebSocket で購読を作るには、`User Access Token` が必�
 
 ## 設定
 
+### チャットのモード変更通知
+
+`user:read:chat` 権限付きの User Access Token がある場合、監視対象の
+`channel.chat_settings.update` を追加購読します。スタンプ限定モードの開始・解除、
+フォロワー限定・サブスク限定・スローモード・重複メッセージ制限の変更を Slack に通知します。
+スローモードとフォロワー限定の待機時間変更も通知します。
+権限がない既存トークンでは警告を出し、従来の配信通知だけを継続します。
+
+追加権限を承認するには、次のコマンドでトークンを再取得してください。
+
+```powershell
+./get-twitch-user-token.ps1 -ClientId YOUR_CLIENT_ID
+```
+
+ブラウザで Twitch の権限を承認し、表示された Access Token / Refresh Token を
+稼働環境の `.env` に反映してプロセスを再起動してください。スクリプトは標準で
+`user:read:chat` を要求します。トークンをチャットや Git に貼り付けないでください。
+
+前回の設定を `state.json` に保存して差分を通知します。初回イベントは変更前の状態が
+不明なので「現在有効／無効（初回受信）」と表示します。起動直後の設定取得や、
+接続が切れていた期間の変更の再取得は行いません。
+
+参照: https://dev.twitch.tv/docs/eventsub/eventsub-subscription-types/#channelchat_settingsupdate
+
 `.env.example` を元に `.env` を作ります。
 
 ```env
