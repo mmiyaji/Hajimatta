@@ -8,6 +8,7 @@ const { listSubscriptions, summarizeSubscriptions } = require("./subscription-di
 const { startDashboard } = require("./terminal-dashboard");
 const { SlackOutbox, sendSlackWebhook } = require("./slack-outbox");
 const { HealthAlerts } = require("./health-alerts");
+const { FileLogger, redactLog } = require("./file-logger");
 const diagnosticOnly = process.argv.includes("--diagnose");
 
 const EVENTSUB_WS_URL = "wss://eventsub.wss.twitch.tv/ws";
@@ -67,6 +68,8 @@ let healthTimer = null;
 let diagnosticTimer = null;
 let chatReconcileTimer = null;
 let chatReconcileInFlight = false;
+let fileLogger = null;
+const freshness = { startedAt: Date.now() };
 
 main().catch(async (error) => {
   clearInterval(healthTimer);
@@ -82,7 +85,7 @@ main().catch(async (error) => {
   log("fatal", error instanceof Error ? error.stack || error.message : String(error));
   if (dashboard) {
     dashboard.close();
-    console.error(error instanceof Error ? error.message : String(error));
+    console.error(redactLog(error instanceof Error ? error.message : String(error), logSecrets()));
   }
   process.exitCode = 1;
   if (instanceGuard) instanceGuard.close().catch(() => {});
@@ -95,6 +98,8 @@ async function main() {
         ? websocket.subscriptionsReady ? "connected" : "registering" : "connecting",
       report: diagnosticReport, reportAt: diagnosticReportAt,
       slack: slackOutbox?.status(),
+      freshness: { ...freshness, wsLimitMs: Math.max((keepaliveTimeoutSeconds + 20) * 1000, 60000), streamLimitMs: config.liveReconcileIntervalMs * 2 + 10000 },
+      logFailed: fileLogger?.failed || false,
       broadcasters: resolvedBroadcasters.map(broadcaster => {
         const current = state.broadcasters[broadcaster.id];
         return { ...broadcaster, live: current?.live || false, title: current?.title || "", categoryName: current?.categoryName || "",
@@ -106,6 +111,9 @@ async function main() {
   }
   if (!diagnosticOnly) {
     instanceGuard = await acquireInstanceGuard(config.twitchClientId, env.TWITCH_INSTANCE_PORT);
+    fileLogger = new FileLogger(env.LOG_DIR || path.join(path.dirname(stateFile), "logs"), {
+      onError: message => { if (dashboard) dashboard.log("error", message); else console.error(message); },
+    });
     log("info", `Instance guard acquired: 127.0.0.1:${instanceGuard.port}`);
   }
   if (!diagnosticOnly) ensureStateDirectory(stateFile);
@@ -203,6 +211,7 @@ async function connect(url, previousSocket = null) {
 
     try {
       const payload = JSON.parse(String(data));
+      if (socket === websocket) freshness.wsReceivedAt = Date.now();
       if (socket !== websocket) {
         if (payload.metadata?.message_type === "notification") await handleMessage(payload, socket);
         return;
@@ -373,6 +382,7 @@ async function diagnoseSubscriptions(sessionId = null) {
     const report = summarizeSubscriptions(snapshot, resolvedBroadcasters, types, sessionId, chatUserId);
     diagnosticReport = report;
     diagnosticReportAt = new Date().toLocaleTimeString();
+    freshness.diagnosticsAt = Date.now();
     healthAlerts?.set("Subscription diagnostics", null);
     log("info", `EventSub diagnostics: cost=${report.totalCost ?? "unknown"}/${report.maxTotalCost ?? "unknown"} total=${report.total ?? "unknown"} enabledWebSockets=${report.enabledWebSockets} (API totals may lag)`);
     for (const row of report.subscriptions) log("info", `EventSub subscription: ${JSON.stringify(row)}`);
@@ -627,6 +637,7 @@ async function hydrateInitialState() {
 
   const streamsByLogin = new Map(streams.map((stream) => [stream.user_login, stream]));
   const channelsById = new Map(channels.map((channel) => [channel.broadcaster_id, channel]));
+  freshness.streamCheckedAt = Date.now();
   let changed = false;
   let liveCount = 0;
   const liveSummaries = [];
@@ -698,6 +709,7 @@ async function reconcileLiveState() {
   let streams;
   try {
     streams = await fetchLiveStreamsByLogin(resolvedBroadcasters.map((b) => b.login));
+    freshness.streamCheckedAt = Date.now();
     healthAlerts?.set("Twitch API", null);
   } catch (error) {
     healthAlerts?.set("Twitch API", "配信状態のAPI補完に失敗しています。ネットワークと認証設定を確認してください。");
@@ -815,6 +827,7 @@ async function reconcileChatSettings() {
         log("warn", `Chat settings API check failed: login=${broadcaster.login} ${error.message}`);
       }
     }
+    if (!failed) freshness.chatCheckedAt = Date.now();
     healthAlerts?.set("Chat settings API", failed ? "チャット設定のAPI補完に失敗しています。ログを確認してください。" : null);
   } finally { chatReconcileInFlight = false; }
 }
@@ -1173,7 +1186,14 @@ function escapeMrkdwn(text) {
   return String(text).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
+function logSecrets() {
+  return [config.twitchAccessToken, config.twitchRefreshToken, config.twitchClientSecret, config.slackWebhookUrl,
+    env.TWITCH_ACCESS_TOKEN, env.TWITCH_REFRESH_TOKEN, env.TWITCH_CLIENT_SECRET];
+}
+
 function log(level, message) {
+  message = redactLog(message, logSecrets());
+  fileLogger?.write(level, message);
   if (dashboard) { dashboard.log(level, message); return; }
   console.log(`${new Date().toISOString()} [${level}] ${message}`);
 }

@@ -8,6 +8,7 @@ function harness(request) {
   const current = { id: "1", login: "channel", displayName: "Channel" };
   const sent = [], alerts = [];
   const context = vm.createContext({
+    freshness: {},
     state: { broadcasters: { "1": current } }, stateFile: "unused", resolvedBroadcasters: [current],
     TWITCH_API_BASE_URL: "https://api.twitch.tv/helix", AbortSignal,
     chatSettingsChanges, normalizeApiChatSettings, encodeURIComponent,

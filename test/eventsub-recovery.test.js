@@ -27,6 +27,7 @@ function harness() {
     const config = { reconnectDelayMs: 5000 };
     let websocket = null, keepaliveTimer = null, reconnectTimer = null, keepaliveTimeoutSeconds = 10;
     let eventsubReady = false;
+    const freshness = {};
     const seenMessageIds = new Set();
     let registrations = 0, notifications = 0;
     ${source.slice(source.indexOf("async function connect("), source.indexOf("async function cleanupManagedSubscriptions("))}

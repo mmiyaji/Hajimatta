@@ -10,6 +10,7 @@ test("startup preserves an observed end but does not invent one for a missed tra
     const broadcaster = { id: "1", login: "channel", live, lastOfflineAt: ended };
     const state = { broadcasters: { "1": broadcaster } };
     const context = vm.createContext({ state, stateFile: "unused", resolvedBroadcasters: [{ id: "1", login: "channel" }],
+      freshness: {},
       fetchLiveStreamsByLogin: async () => [], fetchChannelInformationById: async () => [], saveState() {}, log() {},
     });
     vm.runInContext(source.slice(source.indexOf("async function hydrateInitialState("), source.indexOf("function startLiveReconcileLoop(")), context);

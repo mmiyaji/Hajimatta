@@ -208,3 +208,45 @@ test("keyboard filtering redraws retained INFO history without refreshing data",
     assert.ok(frames.at(-1).includes("LOGS: WARN+"));
   } finally { dashboard.close(); }
 });
+
+function dashboardFixture(t) {
+  const input = new EventEmitter(), output = new EventEmitter(), frames = [];
+  const snapshot = { broadcasters: [{ id: "1", login: "channel", live: false }] };
+  Object.assign(input, { isTTY: true, isRaw: false, isPaused: () => true,
+    setRawMode(value) { this.isRaw = value; }, resume() {}, pause() {} });
+  Object.assign(output, { isTTY: true, rows: 18, columns: 160, write(text) { frames.push(text); } });
+  const dashboard = startDashboard(() => snapshot, { input, output, quit() {} });
+  t.after(() => dashboard.close());
+  return { dashboard, snapshot, key: key => input.emit("data", Buffer.from(key)),
+    view: () => frames.at(-1).replace(/\x1b\[[0-9;]*[A-Za-z]/g, ""), redraw: () => output.emit("resize") };
+}
+
+test("pause freezes log rows while collection and channel status continue", t => {
+  const f = dashboardFixture(t);
+  f.dashboard.log("warn", "before-pause"); f.key("p");
+  f.dashboard.log("warn", "after-pause"); f.snapshot.broadcasters[0].live = true; f.redraw();
+  assert.match(f.view(), /\[PAUSED\] new=1/);
+  assert.match(f.view(), /\[LIVE\]/);
+  assert.ok(!f.view().includes("after-pause"));
+  f.key("p"); assert.match(f.view(), /after-pause/); assert.match(f.view(), /\[FOLLOW\]/);
+});
+
+test("split PageUp/Home sequences scroll history without changing the filter", t => {
+  const f = dashboardFixture(t);
+  for (let i = 0; i < 40; i++) f.dashboard.log("warn", `entry-${String(i).padStart(2, "0")}`);
+  assert.match(f.view(), /entry-39/);
+  f.key("\x1b["); f.key("5~");
+  assert.ok(!f.view().includes("entry-39"));
+  assert.match(f.view(), /LOGS: WARN\+/);
+  f.key("\x1b[1~"); assert.match(f.view(), /entry-00/); assert.match(f.view(), /LOGS: WARN\+/);
+  f.dashboard.log("warn", "new-while-reading"); assert.ok(!f.view().includes("new-while-reading"));
+  f.key("\x1b[F"); assert.match(f.view(), /new-while-reading/); assert.match(f.view(), /\[FOLLOW\]/);
+});
+
+test("freshness markers use actual sample ages and Slack inactivity is not stale", () => {
+  const lines = dashboardLines({ freshness: { startedAt: 100000, wsReceivedAt: 100000, chatCheckedAt: 160000, streamCheckedAt: 100000 },
+    slack: { pending: 0, retrying: 0, lastDeliveredAt: 1000 } }, [], { now: 170000, width: 160 });
+  assert.match(lines[3], /WS \[STALE\] 1m/);
+  assert.match(lines[3], /CHAT \[FRESH\] 10s/);
+  assert.ok(!lines[5].includes("STALE"));
+});

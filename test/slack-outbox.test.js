@@ -25,6 +25,7 @@ test("enqueued payload survives restart and is removed only after delivery", asy
   restarted.start(); await restarted.flush(); await restarted.close();
   assert.deepEqual(sent, [{ text: "stream started" }]);
   assert.equal(JSON.parse(fs.readFileSync(f.file)).items.length, 0);
+  assert.equal(new SlackOutbox(f.file, f.options).status().lastDeliveredAt, 100000);
 });
 
 test("network failures back off across restart and respect Retry-After", async t => {

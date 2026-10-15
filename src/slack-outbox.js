@@ -61,7 +61,7 @@ class SlackOutbox {
       let failure;
       try { await this.send(item.payload); } catch (error) { failure = error; }
       if (!failure) {
-        this.commit({ ...this.data, items: this.data.items.filter(entry => entry.id !== item.id) });
+        this.commit({ ...this.data, lastDeliveredAt: this.now(), items: this.data.items.filter(entry => entry.id !== item.id) });
         this.log("info", `Slack notification delivered: id=${item.id} attempts=${item.attempts + 1}`);
       } else {
         const attempts = item.attempts + 1;
@@ -83,7 +83,7 @@ class SlackOutbox {
 
   async close() { this.stopped = true; this.clearTimer(this.timer); if (this.running) await this.running; }
   status() {
-    return { pending: this.data.items.length, retrying: this.data.items.filter(item => item.attempts > 0).length, stopped: this.stopped };
+    return { pending: this.data.items.length, retrying: this.data.items.filter(item => item.attempts > 0).length, stopped: this.stopped, lastDeliveredAt: this.data.lastDeliveredAt ?? null };
   }
 }
 
