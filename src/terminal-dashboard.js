@@ -36,12 +36,15 @@ function channelRow(name, stream, elapsed, online, update, chat, emotes, categor
   return [tableCell(name, 20), tableCell(stream, 6), tableCell(elapsed, 15), ...[online, update, chat].map(value => tableCell(value, 7)), tableCell(emotes, 7), tableCell(category, 20), clean(title)].join(" | ");
 }
 
-function dashboardLines(snapshot, recent = [], { height = 24, width = 99, now = Date.now() } = {}) {
+const logLevels = { info: 0, warn: 1, error: 2, fatal: 3 };
+const logModes = ["info", "warn", "error"];
+
+function dashboardLines(snapshot, recent = [], { height = 24, width = 99, now = Date.now(), logLevel = "warn" } = {}) {
   const report = snapshot.report;
   const coverage = report?.coverage || [];
   const enabled = coverage.filter(row => row.status === "enabled").length;
   const header = [
-    "Hajimatta | Twitch EventSub monitor | r: refresh | q: quit",
+    "Hajimatta | r: refresh | l: logs (1/2/3) | q: quit",
     `Updated: ${new Date().toLocaleTimeString()}  WS: ${snapshot.connection}`,
     `Subscriptions: ${report ? `${enabled}/${coverage.length}` : "checking"}  Cost: ${report?.totalCost ?? "?"}/${report?.maxTotalCost ?? "?"}  Active sessions: ${report?.enabledWebSockets ?? "?"}`,
     "Cost and coverage reflect the last API check; totals may lag.",
@@ -63,20 +66,22 @@ function dashboardLines(snapshot, recent = [], { height = 24, width = 99, now = 
   ].map(line => wrapLine(line, width)[0]);
   const fixed = [...header, ""].slice(0, Math.max(0, height - 2));
   const capacity = Math.max(0, height - fixed.length - 1);
-  const logs = recent.length ? recent.flatMap(line => wrapLine(line, width)).slice(-capacity) : ["(none)"];
-  const lines = [...fixed, "RECENT WARNINGS / ERRORS (newest at bottom)", ...logs].slice(0, height);
+  const visible = recent.filter(entry => (logLevels[entry.level || "warn"] ?? 0) >= (logLevels[logLevel] ?? 1));
+  const logs = visible.length ? visible.flatMap(entry => wrapLine(typeof entry === "string" ? entry : entry.text, width)).slice(-capacity) : ["(none)"];
+  const lines = [...fixed, `LOGS: ${logLevel.toUpperCase()}+ | 1:INFO+ 2:WARN+ 3:ERROR+ (newest at bottom)`, ...logs].slice(0, height);
   while (lines.length < height) lines.push("");
   return lines.map(line => wrapLine(line, width)[0]);
 }
 
 function colorize(line) {
-  const colors = { "[LIVE]": "1;32", "[OFF]": "90", "[OK]": "32", "[MISS]": "1;31", "[OTHER]": "33", "[EMOTE]": "1;36", "[TEXT]": "90", "[warn]": "33", "[error]": "1;31", "[fatal]": "1;31" };
-  return line.replace(/\[(?:LIVE|OFF|OK|MISS|OTHER|EMOTE|TEXT|warn|error|fatal)\]/g, token => `\x1b[${colors[token]}m${token}\x1b[0m`);
+  const colors = { "[LIVE]": "1;32", "[OFF]": "90", "[OK]": "32", "[MISS]": "1;31", "[OTHER]": "33", "[EMOTE]": "1;36", "[TEXT]": "90", "[info]": "36", "[warn]": "33", "[error]": "1;31", "[fatal]": "1;31" };
+  return line.replace(/\[(?:LIVE|OFF|OK|MISS|OTHER|EMOTE|TEXT|info|warn|error|fatal)\]/g, token => `\x1b[${colors[token]}m${token}\x1b[0m`);
 }
 
-function startDashboard(getSnapshot, { input = process.stdin, output = process.stdout, quit = () => process.exit(0), refresh = async () => {} } = {}) {
+function startDashboard(getSnapshot, { input = process.stdin, output = process.stdout, quit = () => process.exit(0), refresh = async () => {}, logLevel = "warn" } = {}) {
   if (!input.isTTY || !output.isTTY || typeof input.setRawMode !== "function") return null;
   const recent = [];
+  logLevel = logModes.includes(String(logLevel).toLowerCase()) ? String(logLevel).toLowerCase() : "warn";
   const wasRaw = Boolean(input.isRaw);
   const wasPaused = input.isPaused();
   let closed = false;
@@ -84,16 +89,20 @@ function startDashboard(getSnapshot, { input = process.stdin, output = process.s
     if (closed) return;
     const height = Math.max(1, output.rows || 24);
     const width = Math.max(1, (output.columns || 100) - 1);
-    const lines = dashboardLines(getSnapshot(), recent, { height, width });
+    const lines = dashboardLines(getSnapshot(), recent, { height, width, logLevel });
     // Erase each previous row, including its tail, before writing shorter content.
     output.write(`\x1b[H${lines.map(line => `\x1b[2K${colorize(line)}`).join("\r\n")}\x1b[J`);
   };
   const addWarning = (level, message) => {
-    recent.push(`${new Date().toLocaleTimeString()} [${level}] ${clean(message).slice(0, 16000)}`);
+    recent.push({ level, text: `${new Date().toLocaleTimeString()} [${level}] ${clean(message).slice(0, 16000)}` });
     if (recent.length > 1000) recent.shift();
   };
   const onData = chunk => {
     if (String(chunk).includes("q") || String(chunk).includes("\x03")) { close(); quit(); return; }
+    for (const key of String(chunk)) {
+      if (key === "l") { logLevel = logModes[(logModes.indexOf(logLevel) + 1) % logModes.length]; draw(); }
+      if (["1", "2", "3"].includes(key)) { logLevel = logModes[Number(key) - 1]; draw(); }
+    }
     if (String(chunk).includes("r")) {
       Promise.resolve().then(refresh).catch(error => {
         addWarning("error", error.message);
@@ -129,7 +138,7 @@ function startDashboard(getSnapshot, { input = process.stdin, output = process.s
   timer.unref();
   draw();
   return { close, log(level, message) {
-    if (["warn", "error", "fatal"].includes(level)) {
+    if (Object.hasOwn(logLevels, level)) {
       addWarning(level, message);
     }
     draw();

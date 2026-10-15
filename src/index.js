@@ -101,7 +101,7 @@ async function main() {
           startedAt: current?.startedAt, lastOfflineAt: current?.lastOfflineAt,
           emoteMode: current?.chatSettings?.emote_mode };
       }),
-    }), { refresh: () => diagnoseSubscriptions(websocket?.eventsubSessionId || null) });
+    }), { refresh: () => diagnoseSubscriptions(websocket?.eventsubSessionId || null), logLevel: env.DASHBOARD_LOG_LEVEL || "warn" });
     if (!dashboard) log("warn", "Dashboard requires an interactive terminal; using standard logs");
   }
   if (!diagnosticOnly) {

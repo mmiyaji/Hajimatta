@@ -174,3 +174,37 @@ test("emote-only state is visible separately from the chat subscription", () => 
   assert.match(lines[8], /\[EMOTE\]/);
   assert.match(lines[9], /\[TEXT\]/);
 });
+
+test("log levels include higher severity and always include fatal errors", () => {
+  const entries = ["info", "warn", "error", "fatal"].map(level => ({ level, text: `entry-${level}` }));
+  for (const [logLevel, expected] of [["info", entries], ["warn", entries.slice(1)], ["error", entries.slice(2)]]) {
+    const text = dashboardLines({}, entries, { logLevel }).join("\n");
+    for (const entry of entries) assert.equal(text.includes(entry.text), expected.includes(entry));
+    assert.ok(text.includes(`LOGS: ${logLevel.toUpperCase()}+`));
+  }
+});
+
+test("keyboard filtering redraws retained INFO history without refreshing data", () => {
+  const input = new EventEmitter();
+  Object.assign(input, { isTTY: true, isRaw: false, isPaused: () => true,
+    setRawMode(value) { this.isRaw = value; }, resume() {}, pause() {} });
+  const frames = [];
+  const output = { isTTY: true, rows: 24, columns: 100, write(text) { frames.push(text); } };
+  const dashboard = startDashboard(() => ({}), { input, output });
+  try {
+    dashboard.log("info", "information-message");
+    dashboard.log("warn", "warning-message");
+    dashboard.log("error", "error-message");
+    assert.ok(!frames.at(-1).includes("information-message"));
+    input.emit("data", Buffer.from("1"));
+    assert.ok(frames.at(-1).includes("information-message"));
+    input.emit("data", Buffer.from("3"));
+    assert.ok(!frames.at(-1).includes("warning-message"));
+    assert.ok(frames.at(-1).includes("error-message"));
+    input.emit("data", Buffer.from("l"));
+    assert.ok(frames.at(-1).includes("LOGS: INFO+"));
+    assert.ok(frames.at(-1).includes("information-message"));
+    input.emit("data", Buffer.from("2"));
+    assert.ok(frames.at(-1).includes("LOGS: WARN+"));
+  } finally { dashboard.close(); }
+});
