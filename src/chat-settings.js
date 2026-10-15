@@ -23,4 +23,19 @@ function chatSettingsChanges(previous, current) {
   return changes;
 }
 
-module.exports = { chatSettingsChanges };
+function normalizeApiChatSettings(settings, broadcaster) {
+  if (!settings || settings.broadcaster_id !== broadcaster.id || typeof settings.emote_mode !== "boolean") {
+    throw new Error("Invalid chat settings API response");
+  }
+  return {
+    broadcaster_user_id: broadcaster.id, broadcaster_user_login: broadcaster.login,
+    broadcaster_user_name: broadcaster.displayName || broadcaster.login,
+    emote_mode: settings.emote_mode, follower_mode: settings.follower_mode,
+    follower_mode_duration_minutes: settings.follower_mode_duration,
+    subscriber_mode: settings.subscriber_mode, slow_mode: settings.slow_mode,
+    slow_mode_wait_time_seconds: settings.slow_mode_wait_time,
+    unique_chat_mode: settings.unique_chat_mode,
+  };
+}
+
+module.exports = { chatSettingsChanges, normalizeApiChatSettings };

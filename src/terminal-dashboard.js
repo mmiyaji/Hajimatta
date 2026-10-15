@@ -32,8 +32,8 @@ function formatElapsed(broadcaster, now = Date.now()) {
   return `${broadcaster.live ? "" : "~"}${days ? `${days}d ` : ""}${time}`;
 }
 
-function channelRow(name, stream, elapsed, online, update, chat, category = "", title = "") {
-  return [tableCell(name, 20), tableCell(stream, 6), tableCell(elapsed, 15), ...[online, update, chat].map(value => tableCell(value, 7)), tableCell(category, 20), clean(title)].join(" | ");
+function channelRow(name, stream, elapsed, online, update, chat, emotes, category = "", title = "") {
+  return [tableCell(name, 20), tableCell(stream, 6), tableCell(elapsed, 15), ...[online, update, chat].map(value => tableCell(value, 7)), tableCell(emotes, 7), tableCell(category, 20), clean(title)].join(" | ");
 }
 
 function dashboardLines(snapshot, recent = [], { height = 24, width = 99, now = Date.now() } = {}) {
@@ -48,7 +48,7 @@ function dashboardLines(snapshot, recent = [], { height = 24, width = 99, now = 
     report ? `Last API check: ${snapshot.reportAt || "-"}` : "Waiting for subscription diagnostics...",
     `Slack: pending=${snapshot.slack?.pending ?? "?"} retrying=${snapshot.slack?.retrying ?? "?"}${snapshot.slack?.stopped ? " [STOPPED]" : ""}`,
     "",
-    channelRow("CHANNEL", "STREAM", "ELAPSED", "ONLINE", "UPDATE", "CHAT", "CATEGORY", "TITLE"),
+    channelRow("CHANNEL", "STREAM", "ELAPSED", "ONLINE", "UPDATE", "CHAT", "EMOTES", "CATEGORY", "TITLE"),
     ...(snapshot.broadcasters || []).map(broadcaster => {
       const statuses = { enabled: "[OK]", missing: "[MISS]", other_session: "[OTHER]" };
       const events = ["stream.online", "channel.update", "channel.chat_settings.update"].map(type => {
@@ -56,6 +56,7 @@ function dashboardLines(snapshot, recent = [], { height = 24, width = 99, now = 
         return row ? statuses[row.status] || "[?]" : report ? "-" : "[?]";
       });
       return channelRow(broadcaster.login, broadcaster.live ? "[LIVE]" : "[OFF]", formatElapsed(broadcaster, now), ...events,
+        broadcaster.emoteMode === true ? "[EMOTE]" : broadcaster.emoteMode === false ? "[TEXT]" : "[?]",
         broadcaster.live ? broadcaster.categoryName || "-" : "",
         broadcaster.live ? broadcaster.title || "-" : "");
     }),
@@ -69,8 +70,8 @@ function dashboardLines(snapshot, recent = [], { height = 24, width = 99, now = 
 }
 
 function colorize(line) {
-  const colors = { "[LIVE]": "1;32", "[OFF]": "90", "[OK]": "32", "[MISS]": "1;31", "[OTHER]": "33", "[warn]": "33", "[error]": "1;31", "[fatal]": "1;31" };
-  return line.replace(/\[(?:LIVE|OFF|OK|MISS|OTHER|warn|error|fatal)\]/g, token => `\x1b[${colors[token]}m${token}\x1b[0m`);
+  const colors = { "[LIVE]": "1;32", "[OFF]": "90", "[OK]": "32", "[MISS]": "1;31", "[OTHER]": "33", "[EMOTE]": "1;36", "[TEXT]": "90", "[warn]": "33", "[error]": "1;31", "[fatal]": "1;31" };
+  return line.replace(/\[(?:LIVE|OFF|OK|MISS|OTHER|EMOTE|TEXT|warn|error|fatal)\]/g, token => `\x1b[${colors[token]}m${token}\x1b[0m`);
 }
 
 function startDashboard(getSnapshot, { input = process.stdin, output = process.stdout, quit = () => process.exit(0), refresh = async () => {} } = {}) {

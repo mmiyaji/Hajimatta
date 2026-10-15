@@ -166,3 +166,11 @@ test("elapsed column advances without changing the table layout", () => {
   assert.match(second[8], /01:00:01/);
   assert.equal(first.length, second.length);
 });
+
+test("emote-only state is visible separately from the chat subscription", () => {
+  const snapshot = { broadcasters: [{ id: "1", login: "on", emoteMode: true }, { id: "2", login: "off", emoteMode: false }] };
+  const lines = dashboardLines(snapshot, [], { width: 160 });
+  assert.match(lines[7], /EMOTES/);
+  assert.match(lines[8], /\[EMOTE\]/);
+  assert.match(lines[9], /\[TEXT\]/);
+});

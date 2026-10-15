@@ -2,7 +2,7 @@
 const WebSocket = require("ws");
 const fs = require("node:fs");
 const path = require("node:path");
-const { chatSettingsChanges } = require("./chat-settings");
+const { chatSettingsChanges, normalizeApiChatSettings } = require("./chat-settings");
 const { acquireInstanceGuard } = require("./instance-guard");
 const { listSubscriptions, summarizeSubscriptions } = require("./subscription-diagnostics");
 const { startDashboard } = require("./terminal-dashboard");
@@ -65,10 +65,13 @@ let slackOutbox = null;
 let healthAlerts = null;
 let healthTimer = null;
 let diagnosticTimer = null;
+let chatReconcileTimer = null;
+let chatReconcileInFlight = false;
 
 main().catch(async (error) => {
   clearInterval(healthTimer);
   clearInterval(diagnosticTimer);
+  clearInterval(chatReconcileTimer);
   if (healthAlerts) {
     try {
       healthAlerts.set("Process startup", "起動処理に失敗しました。稼働環境のログを確認してください。", true);
@@ -95,7 +98,8 @@ async function main() {
       broadcasters: resolvedBroadcasters.map(broadcaster => {
         const current = state.broadcasters[broadcaster.id];
         return { ...broadcaster, live: current?.live || false, title: current?.title || "", categoryName: current?.categoryName || "",
-          startedAt: current?.startedAt, lastOfflineAt: current?.lastOfflineAt };
+          startedAt: current?.startedAt, lastOfflineAt: current?.lastOfflineAt,
+          emoteMode: current?.chatSettings?.emote_mode };
       }),
     }), { refresh: () => diagnoseSubscriptions(websocket?.eventsubSessionId || null) });
     if (!dashboard) log("warn", "Dashboard requires an interactive terminal; using standard logs");
@@ -137,6 +141,10 @@ async function main() {
   await cleanupManagedSubscriptions();
   await connect(EVENTSUB_WS_URL);
   startLiveReconcileLoop();
+  void reconcileChatSettings().catch(error => log("warn", error.message));
+  chatReconcileTimer = setInterval(() => {
+    reconcileChatSettings().catch(error => log("warn", error.message));
+  }, 30000);
   healthAlerts.set("Process startup", null);
   diagnosticTimer = setInterval(() => {
     diagnoseSubscriptions(websocket?.eventsubSessionId || null).catch(() => {
@@ -451,7 +459,7 @@ async function ensureValidUserAccessToken() {
   if (!diagnosticOnly) clearAuthFailureNotice();
   healthAlerts?.set("Twitch authentication", null);
   chatUserId = validation.data.scopes?.includes("user:read:chat") ? validation.data.user_id : null;
-  if (!chatUserId) log("warn", "Chat mode notifications disabled: reauthorize token with user:read:chat scope");
+  if (!chatUserId) log("warn", "Chat mode realtime events disabled: reauthorize with user:read:chat; API polling remains active");
   log("info", `Validated user token for ${validation.data.login}`);
 }
 
@@ -786,18 +794,48 @@ async function handleNotification(subscription, event) {
   }
 }
 
-async function handleChatSettingsUpdate(event) {
+async function reconcileChatSettings() {
+  if (chatReconcileInFlight) return;
+  chatReconcileInFlight = true;
+  let failed = false;
+  try {
+    for (const broadcaster of resolvedBroadcasters) {
+      const expectedSettings = state.broadcasters[broadcaster.id]?.chatSettings;
+      try {
+        const response = await twitchFetch(`${TWITCH_API_BASE_URL}/chat/settings?broadcaster_id=${encodeURIComponent(broadcaster.id)}`,
+          { headers: twitchHeaders(), signal: AbortSignal.timeout(10000) }, { retryOnUnauthorized: true });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const json = await response.json();
+        const event = normalizeApiChatSettings(json.data?.[0], broadcaster);
+        // A live event received during the request is newer than this API snapshot.
+        if (state.broadcasters[broadcaster.id]?.chatSettings !== expectedSettings) continue;
+        await handleChatSettingsUpdate(event, "api");
+      } catch (error) {
+        failed = true;
+        log("warn", `Chat settings API check failed: login=${broadcaster.login} ${error.message}`);
+      }
+    }
+    healthAlerts?.set("Chat settings API", failed ? "チャット設定のAPI補完に失敗しています。ログを確認してください。" : null);
+  } finally { chatReconcileInFlight = false; }
+}
+
+async function handleChatSettingsUpdate(event, source = "eventsub") {
   const broadcaster = ensureBroadcasterState(event);
-  const changes = chatSettingsChanges(broadcaster.chatSettings, event);
+  const previous = broadcaster.chatSettings;
+  // First API sample establishes a baseline. An already-active emote mode is still reported.
+  const changes = source === "api" && !previous
+    ? event.emote_mode ? ["スタンプ限定モード: 現在有効（API初回確認）"] : []
+    : chatSettingsChanges(previous, event);
   if (changes.length) {
-    await postToSlack(buildSlackPayload({
+    postToSlack(buildSlackPayload({
       headlineText: `${displayNameOf(broadcaster)} chat mode updated`,
       iconUrl: broadcaster.profileImageUrl,
-      plainLines: [`${displayNameOf(broadcaster)} のチャット設定が更新されました。`, ...changes, `URL: ${streamUrl(broadcaster.login)}`],
-      blockLines: [`*${escapeMrkdwn(displayNameOf(broadcaster))}* のチャット設定が更新されました。`, ...changes.map(escapeMrkdwn), `*URL*: ${streamUrl(broadcaster.login)}`],
+      plainLines: [`${displayNameOf(broadcaster)} のチャット設定が更新されました。`, ...changes, `検知経路: ${source === "api" ? "API補完" : "EventSub"}`, `URL: ${streamUrl(broadcaster.login)}`],
+      blockLines: [`*${escapeMrkdwn(displayNameOf(broadcaster))}* のチャット設定が更新されました。`, ...changes.map(escapeMrkdwn), `*検知経路*: ${source === "api" ? "API補完" : "EventSub"}`, `*URL*: ${streamUrl(broadcaster.login)}`],
     }));
-    log("info", `Chat mode updated: login=${broadcaster.login} ${changes.join("; ")}`);
+    log("info", `Chat mode notification queued: source=${source} login=${broadcaster.login} ${changes.join("; ")}`);
   }
+  if (source === "eventsub" || !previous) log("info", `Chat settings received: source=${source} login=${broadcaster.login} emote_mode=${event.emote_mode}`);
   broadcaster.chatSettings = { ...event };
   saveState(stateFile, state);
 }
@@ -919,7 +957,7 @@ async function handleChannelUpdate(event) {
 
   log("info", `Channel update notified: login=${broadcaster.login} title=${broadcaster.title || "(empty)"} category=${broadcaster.categoryName || "(empty)"} url=${streamUrl(broadcaster.login)}`);
 }
-async function postToSlack(payload) {
+function postToSlack(payload) {
   if (!slackOutbox) throw new Error("Slack outbox is not initialized");
   slackOutbox.enqueue(payload);
 }
