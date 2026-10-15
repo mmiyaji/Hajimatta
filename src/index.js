@@ -90,6 +90,7 @@ async function connect(url, previousSocket = null) {
     if (socket !== websocket) return;
     log("warn", reason);
     clearTimeout(setupTimer);
+    clearTimeout(socket.subscriptionRetryTimer);
     clearKeepaliveTimer();
     websocket = null;
     socket.terminate();
@@ -124,7 +125,7 @@ async function connect(url, previousSocket = null) {
         await handleMessage(payload, socket, Boolean(previousSocket));
         if (socket !== websocket) return;
         clearTimeout(setupTimer);
-        log("info", "EventSub session ready");
+        log("info", "EventSub session setup completed (see subscription status above)");
       } else {
         await handleMessage(payload, socket);
       }
@@ -137,6 +138,7 @@ async function connect(url, previousSocket = null) {
   socket.previousSocket = previousSocket;
   socket.on("close", (code, reason) => {
     clearTimeout(setupTimer);
+    clearTimeout(socket.subscriptionRetryTimer);
     if (socket !== websocket) return;
     log("warn", `WebSocket closed: code=${code} reason=${String(reason) || "(none)"}`);
     clearKeepaliveTimer();
@@ -201,27 +203,38 @@ async function handleMessage(payload, socket = websocket, transferred = false) {
 async function registerSubscriptions(sessionId, socket = websocket) {
   const total = resolvedBroadcasters.length * (SUBSCRIPTION_TYPES.length + (chatUserId ? 1 : 0));
   log("info", `Registering ${total} subscriptions on session ${sessionId}`);
-
-  for (const broadcaster of resolvedBroadcasters) {
-    for (const type of SUBSCRIPTION_TYPES) {
-      if (socket !== websocket) return;
-      await createSubscription(type, broadcaster.id, sessionId);
-    }
-  }
-
-  if (chatUserId) {
+  socket.registeredSubscriptions ||= new Set();
+  let retryDelayMs = 0;
+  // Register zero-cost chat events first so a full cost budget cannot prevent them.
+  const types = [...(chatUserId ? [CHAT_SETTINGS_TYPE] : []), ...SUBSCRIPTION_TYPES];
+  for (const type of types) {
     for (const broadcaster of resolvedBroadcasters) {
       if (socket !== websocket) return;
+      const key = `${type}:${broadcaster.id}`;
+      if (socket.registeredSubscriptions.has(key)) continue;
       try {
-        await createSubscription(CHAT_SETTINGS_TYPE, broadcaster.id, sessionId);
+        await createSubscription(type, broadcaster.id, sessionId);
+        socket.registeredSubscriptions.add(key);
       } catch (error) {
-        log("warn", `Chat settings subscription failed for ${broadcaster.login}: ${error.message}`);
-        throw error;
+        if (error.status !== 429) throw error;
+        retryDelayMs = Math.max(retryDelayMs, error.retryDelayMs || 60000);
+        log("warn", `Subscription deferred: ${key}; keeping active subscriptions. ${error.message}`);
       }
     }
   }
-
-  if (socket === websocket) eventsubReady = true;
+  if (socket !== websocket) return;
+  eventsubReady = true;
+  if (retryDelayMs) {
+    log("warn", `EventSub partially ready: ${socket.registeredSubscriptions.size}/${total}; retry in ${Math.ceil(retryDelayMs / 1000)}s. Check for another running instance or subscriptions sharing this Twitch application/user.`);
+    clearTimeout(socket.subscriptionRetryTimer);
+    socket.subscriptionRetryTimer = setTimeout(() => {
+      if (socket !== websocket) return;
+      registerSubscriptions(sessionId, socket).catch(error => {
+        log("error", error.stack || error.message);
+        if (socket === websocket) socket.terminate();
+      });
+    }, retryDelayMs);
+  }
 }
 
 async function cleanupManagedSubscriptions() {
@@ -287,7 +300,11 @@ async function createSubscription(type, broadcasterUserId, sessionId) {
 
   if (!response.ok) {
     const text = await response.text();
-    throw new Error(`Failed to create subscription ${type}:${broadcasterUserId}: ${response.status} ${text}`);
+    const error = new Error(`Failed to create subscription ${type}:${broadcasterUserId}: ${response.status} ${text}`);
+    error.status = response.status;
+    const resetSeconds = Number(response.headers?.get("Ratelimit-Reset"));
+    error.retryDelayMs = Math.max(60000, Number.isFinite(resetSeconds) ? resetSeconds * 1000 - Date.now() + 1000 : 0);
+    throw error;
   }
 
   log("info", `Subscribed: ${type}:${broadcasterUserId}`);
@@ -570,7 +587,7 @@ async function reconcileLiveState() {
       state.broadcasters[broadcaster.id] = current;
       changed = true;
       reconciledOnline += 1;
-      if (eventsubReady) {
+      {
         await postToSlack({
           ...buildSlackPayload({
             headlineText: `${displayNameOf(current)} started streaming`,
