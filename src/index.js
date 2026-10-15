@@ -94,7 +94,8 @@ async function main() {
       slack: slackOutbox?.status(),
       broadcasters: resolvedBroadcasters.map(broadcaster => {
         const current = state.broadcasters[broadcaster.id];
-        return { ...broadcaster, live: current?.live || false, title: current?.title || "", categoryName: current?.categoryName || "" };
+        return { ...broadcaster, live: current?.live || false, title: current?.title || "", categoryName: current?.categoryName || "",
+          startedAt: current?.startedAt, lastOfflineAt: current?.lastOfflineAt };
       }),
     }), { refresh: () => diagnoseSubscriptions(websocket?.eventsubSessionId || null) });
     if (!dashboard) log("warn", "Dashboard requires an interactive terminal; using standard logs");
@@ -633,6 +634,8 @@ async function hydrateInitialState() {
     const nextLive = Boolean(liveStream);
     const nextStartedAt = liveStream?.started_at || null;
     const nextInitialUpdateNotified = nextLive;
+    // A transition missed while stopped has no reliable end timestamp.
+    const nextLastOfflineAt = nextLive || current.live ? null : current.lastOfflineAt ?? null;
 
     if (
       current.title !== nextTitle ||
@@ -641,6 +644,7 @@ async function hydrateInitialState() {
       current.language !== nextLanguage ||
       current.live !== nextLive ||
       current.startedAt !== nextStartedAt ||
+      current.lastOfflineAt !== nextLastOfflineAt ||
       current.initialUpdateNotified !== nextInitialUpdateNotified
     ) {
       current.title = nextTitle;
@@ -649,6 +653,7 @@ async function hydrateInitialState() {
       current.language = nextLanguage;
       current.live = nextLive;
       current.startedAt = nextStartedAt;
+      current.lastOfflineAt = nextLastOfflineAt;
       current.initialUpdateNotified = nextInitialUpdateNotified;
       state.broadcasters[broadcaster.id] = current;
       changed = true;
@@ -701,6 +706,7 @@ async function reconcileLiveState() {
 
     if (liveStream && !current.live) {
       current.live = true;
+      current.lastOfflineAt = null;
       current.startedAt = liveStream.started_at || null;
       current.initialUpdateNotified = false;
       state.broadcasters[broadcaster.id] = current;
@@ -749,6 +755,7 @@ async function reconcileLiveState() {
       }));
 
       current.live = false;
+      current.lastOfflineAt = new Date().toISOString();
       current.startedAt = null;
       current.initialUpdateNotified = false;
       state.broadcasters[broadcaster.id] = current;
@@ -798,6 +805,7 @@ async function handleChatSettingsUpdate(event) {
 async function handleStreamOnline(event) {
   const broadcaster = ensureBroadcasterState(event);
   broadcaster.live = true;
+  broadcaster.lastOfflineAt = null;
   broadcaster.startedAt = event.started_at || null;
   broadcaster.initialUpdateNotified = false;
   saveState(stateFile, state);
@@ -1050,6 +1058,7 @@ function seedBroadcaster(broadcaster) {
     live: false,
     initialUpdateNotified: false,
     startedAt: null,
+    lastOfflineAt: null,
   };
 }
 

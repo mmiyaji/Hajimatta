@@ -1,7 +1,7 @@
 const { test } = require("node:test");
 const assert = require("node:assert/strict");
 const { EventEmitter } = require("node:events");
-const { dashboardLines, startDashboard } = require("../src/terminal-dashboard");
+const { dashboardLines, startDashboard, formatElapsed } = require("../src/terminal-dashboard");
 
 test("fixed view includes connection, cost, coverage and sanitized warnings", () => {
   const lines = dashboardLines({ connection: "connected", reportAt: "12:00", report: {
@@ -10,7 +10,7 @@ test("fixed view includes connection, cost, coverage and sanitized warnings", ()
   }, broadcasters: [{ id: "1", login: "channel", live: true }] }, ["error\x1b[2J\nmessage"]);
   const text = lines.join("\n");
   assert.match(text, /Cost: 10\/10/);
-  assert.match(text, /channel\s+\| \[LIVE\]\s+\| \[OTHER\]/);
+  assert.match(text, /channel\s+\| \[LIVE\]\s+\| unknown\s+\| \[OTHER\]/);
   assert.equal(lines.some(line => /[\x00-\x1f]/.test(line)), false);
 });
 
@@ -92,7 +92,7 @@ test("table columns align for different names, stream states and subscription st
   const report = { coverage: broadcasters.flatMap(b => ["stream.online", "channel.update", "channel.chat_settings.update"].map((type, i) => ({
     broadcasterId: b.id, type, status: ["enabled", "missing", "other_session"][i],
   }))) };
-  const lines = dashboardLines({ broadcasters, report }, [], { width: 99, height: 24 });
+  const lines = dashboardLines({ broadcasters, report }, [], { width: 160, height: 24 });
   const table = lines.slice(7, 10);
   const separators = line => [...line.matchAll(/\|/g)].map(match => match.index);
   assert.equal(table[0].trim().startsWith("CHANNEL"), true);
@@ -146,4 +146,23 @@ test("shorter redraws erase previous characters from every terminal row", () => 
     assert.ok(!rows.join("\n").includes("[LIVE]"));
     assert.ok(frames.at(-1).split("\r\n").slice(1).every(line => line.startsWith("\x1b[2K")));
   } finally { dashboard.close(); }
+});
+
+test("elapsed time uses stream start while live and observed end while offline", () => {
+  const now = Date.parse("2026-10-15T12:00:00Z");
+  assert.equal(formatElapsed({ live: true, startedAt: "2026-10-15T10:29:55Z" }, now), "01:30:05");
+  assert.equal(formatElapsed({ live: false, lastOfflineAt: "2026-10-13T11:00:00Z" }, now), "~2d 01:00:00");
+  for (const timestamp of [undefined, "invalid", "2026-10-16T12:00:00Z"]) {
+    assert.equal(formatElapsed({ live: true, startedAt: timestamp }, now), "unknown");
+  }
+  assert.equal(formatElapsed({ live: false, startedAt: "2026-10-15T10:00:00Z" }, now), "unknown");
+});
+
+test("elapsed column advances without changing the table layout", () => {
+  const snapshot = { broadcasters: [{ id: "1", login: "channel", live: true, startedAt: "2026-10-15T10:00:00Z" }] };
+  const first = dashboardLines(snapshot, [], { now: Date.parse("2026-10-15T11:00:00Z"), width: 140 });
+  const second = dashboardLines(snapshot, [], { now: Date.parse("2026-10-15T11:00:01Z"), width: 140 });
+  assert.match(first[8], /01:00:00/);
+  assert.match(second[8], /01:00:01/);
+  assert.equal(first.length, second.length);
 });

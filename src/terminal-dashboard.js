@@ -21,11 +21,22 @@ function tableCell(value, width) {
   return text + " ".repeat(Math.max(0, width - cells));
 }
 
-function channelRow(name, stream, online, update, chat, category = "", title = "") {
-  return [tableCell(name, 20), tableCell(stream, 6), ...[online, update, chat].map(value => tableCell(value, 7)), tableCell(category, 20), clean(title)].join(" | ");
+function formatElapsed(broadcaster, now = Date.now()) {
+  const timestamp = broadcaster.live ? broadcaster.startedAt : broadcaster.lastOfflineAt;
+  const started = timestamp ? Date.parse(timestamp) : NaN;
+  if (!Number.isFinite(started) || started > now) return "unknown";
+  const seconds = Math.floor((now - started) / 1000);
+  const days = Math.floor(seconds / 86400);
+  const time = [Math.floor(seconds / 3600) % 24, Math.floor(seconds / 60) % 60, seconds % 60]
+    .map(value => String(value).padStart(2, "0")).join(":");
+  return `${broadcaster.live ? "" : "~"}${days ? `${days}d ` : ""}${time}`;
 }
 
-function dashboardLines(snapshot, recent = [], { height = 24, width = 99 } = {}) {
+function channelRow(name, stream, elapsed, online, update, chat, category = "", title = "") {
+  return [tableCell(name, 20), tableCell(stream, 6), tableCell(elapsed, 15), ...[online, update, chat].map(value => tableCell(value, 7)), tableCell(category, 20), clean(title)].join(" | ");
+}
+
+function dashboardLines(snapshot, recent = [], { height = 24, width = 99, now = Date.now() } = {}) {
   const report = snapshot.report;
   const coverage = report?.coverage || [];
   const enabled = coverage.filter(row => row.status === "enabled").length;
@@ -37,14 +48,14 @@ function dashboardLines(snapshot, recent = [], { height = 24, width = 99 } = {})
     report ? `Last API check: ${snapshot.reportAt || "-"}` : "Waiting for subscription diagnostics...",
     `Slack: pending=${snapshot.slack?.pending ?? "?"} retrying=${snapshot.slack?.retrying ?? "?"}${snapshot.slack?.stopped ? " [STOPPED]" : ""}`,
     "",
-    channelRow("CHANNEL", "STREAM", "ONLINE", "UPDATE", "CHAT", "CATEGORY", "TITLE"),
+    channelRow("CHANNEL", "STREAM", "ELAPSED", "ONLINE", "UPDATE", "CHAT", "CATEGORY", "TITLE"),
     ...(snapshot.broadcasters || []).map(broadcaster => {
       const statuses = { enabled: "[OK]", missing: "[MISS]", other_session: "[OTHER]" };
       const events = ["stream.online", "channel.update", "channel.chat_settings.update"].map(type => {
         const row = coverage.find(row => row.broadcasterId === broadcaster.id && row.type === type);
         return row ? statuses[row.status] || "[?]" : report ? "-" : "[?]";
       });
-      return channelRow(broadcaster.login, broadcaster.live ? "[LIVE]" : "[OFF]", ...events,
+      return channelRow(broadcaster.login, broadcaster.live ? "[LIVE]" : "[OFF]", formatElapsed(broadcaster, now), ...events,
         broadcaster.live ? broadcaster.categoryName || "-" : "",
         broadcaster.live ? broadcaster.title || "-" : "");
     }),
@@ -124,4 +135,4 @@ function startDashboard(getSnapshot, { input = process.stdin, output = process.s
   } };
 }
 
-module.exports = { dashboardLines, startDashboard };
+module.exports = { dashboardLines, startDashboard, formatElapsed };
