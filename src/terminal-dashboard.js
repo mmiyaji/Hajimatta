@@ -2,11 +2,24 @@ function clean(value) {
   return String(value ?? "-").replace(/[\x00-\x1f\x7f-\x9f]/g, " ");
 }
 
-function dashboardLines(snapshot, recent = []) {
+function wrapLine(value, width) {
+  const lines = [];
+  let line = "", cells = 0;
+  for (const char of clean(value)) {
+    const size = /\p{Mark}/u.test(char) ? 0 : char.codePointAt(0) > 127 ? 2 : 1;
+    if (cells + size > width && line) { lines.push(line); line = ""; cells = 0; }
+    if (size > width) continue;
+    line += char; cells += size;
+  }
+  lines.push(line);
+  return lines;
+}
+
+function dashboardLines(snapshot, recent = [], { height = 24, width = 99 } = {}) {
   const report = snapshot.report;
   const coverage = report?.coverage || [];
   const enabled = coverage.filter(row => row.status === "enabled").length;
-  return [
+  const header = [
     "Hajimatta | Twitch EventSub monitor | r: refresh | q: quit",
     `Updated: ${new Date().toLocaleTimeString()}  WS: ${snapshot.connection}`,
     `Subscriptions: ${report ? `${enabled}/${coverage.length}` : "checking"}  Cost: ${report?.totalCost ?? "?"}/${report?.maxTotalCost ?? "?"}  Active sessions: ${report?.enabledWebSockets ?? "?"}`,
@@ -16,14 +29,23 @@ function dashboardLines(snapshot, recent = []) {
     "CHANNEL | STREAM | EVENT SUBSCRIPTIONS",
     ...(snapshot.broadcasters || []).map(broadcaster => {
       const labels = { "stream.online": "online", "channel.update": "update", "channel.chat_settings.update": "chat" };
+      const statuses = { enabled: "[OK]", missing: "[MISS]", other_session: "[OTHER]" };
       const events = coverage.filter(row => row.broadcasterId === broadcaster.id)
-        .map(row => `${labels[row.type] || row.type}=${row.status}`).join(" / ");
-      return `${broadcaster.login} | ${broadcaster.live ? "LIVE" : "offline"} | ${events || "checking"}`;
+        .map(row => `${labels[row.type] || row.type}${statuses[row.status] || "[?]"}`).join(" ");
+      return `${broadcaster.live ? "[LIVE]" : "[OFF]"} ${clean(broadcaster.login).slice(0, 20)} | ${events || "checking"}`;
     }),
-    "",
-    "RECENT WARNINGS / ERRORS",
-    ...(recent.length ? recent.slice(-5) : ["(none)"]),
-  ].map(clean);
+  ].map(line => wrapLine(line, width)[0]);
+  const fixed = header.slice(0, Math.max(0, height - 2));
+  const capacity = Math.max(0, height - fixed.length - 1);
+  const logs = recent.length ? recent.flatMap(line => wrapLine(line, width)).slice(-capacity) : ["(none)"];
+  const lines = [...fixed, "RECENT WARNINGS / ERRORS (newest at bottom)", ...logs].slice(0, height);
+  while (lines.length < height) lines.push("");
+  return lines.map(line => wrapLine(line, width)[0]);
+}
+
+function colorize(line) {
+  const colors = { "[LIVE]": "1;32", "[OFF]": "90", "[OK]": "32", "[MISS]": "1;31", "[OTHER]": "33", "[warn]": "33", "[error]": "1;31", "[fatal]": "1;31" };
+  return line.replace(/\[(?:LIVE|OFF|OK|MISS|OTHER|warn|error|fatal)\]/g, token => `\x1b[${colors[token]}m${token}\x1b[0m`);
 }
 
 function startDashboard(getSnapshot, { input = process.stdin, output = process.stdout, quit = () => process.exit(0), refresh = async () => {} } = {}) {
@@ -36,24 +58,18 @@ function startDashboard(getSnapshot, { input = process.stdin, output = process.s
     if (closed) return;
     const height = Math.max(1, output.rows || 24);
     const width = Math.max(1, (output.columns || 100) - 1);
-    const lines = dashboardLines(getSnapshot(), recent).slice(0, height).map(line => {
-      // Count non-ASCII characters conservatively as two terminal cells.
-      let cells = 0, result = "";
-      for (const char of line) {
-        cells += char.codePointAt(0) > 127 ? 2 : 1;
-        if (cells > width) break;
-        result += char;
-      }
-      return result;
-    });
-    output.write(`\x1b[H${lines.join("\n")}\x1b[J`);
+    const lines = dashboardLines(getSnapshot(), recent, { height, width });
+    output.write(`\x1b[H${lines.map(colorize).join("\r\n")}\x1b[J`);
+  };
+  const addWarning = (level, message) => {
+    recent.push(`${new Date().toLocaleTimeString()} [${level}] ${clean(message).slice(0, 16000)}`);
+    if (recent.length > 1000) recent.shift();
   };
   const onData = chunk => {
     if (String(chunk).includes("q") || String(chunk).includes("\x03")) { close(); quit(); return; }
     if (String(chunk).includes("r")) {
       Promise.resolve().then(refresh).catch(error => {
-        recent.push(`[error] ${error.message}`);
-        if (recent.length > 5) recent.shift();
+        addWarning("error", error.message);
         draw();
       });
     }
@@ -66,6 +82,7 @@ function startDashboard(getSnapshot, { input = process.stdin, output = process.s
     closed = true;
     clearInterval(timer);
     input.removeListener("data", onData);
+    output.removeListener?.("resize", draw);
     process.removeListener("exit", onExit);
     process.removeListener("SIGINT", onInterrupt);
     process.removeListener("SIGTERM", onTerminate);
@@ -77,6 +94,7 @@ function startDashboard(getSnapshot, { input = process.stdin, output = process.s
   input.setRawMode(true);
   input.resume();
   input.on("data", onData);
+  output.on?.("resize", draw);
   process.once("exit", onExit);
   process.once("SIGINT", onInterrupt);
   process.once("SIGTERM", onTerminate);
@@ -85,8 +103,7 @@ function startDashboard(getSnapshot, { input = process.stdin, output = process.s
   draw();
   return { close, log(level, message) {
     if (["warn", "error", "fatal"].includes(level)) {
-      recent.push(`${new Date().toLocaleTimeString()} [${level}] ${message}`);
-      if (recent.length > 5) recent.shift();
+      addWarning(level, message);
     }
     draw();
   } };
