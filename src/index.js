@@ -3,6 +3,10 @@ const WebSocket = require("ws");
 const fs = require("node:fs");
 const path = require("node:path");
 const { chatSettingsChanges } = require("./chat-settings");
+const { acquireInstanceGuard } = require("./instance-guard");
+const { listSubscriptions, summarizeSubscriptions } = require("./subscription-diagnostics");
+const { startDashboard } = require("./terminal-dashboard");
+const diagnosticOnly = process.argv.includes("--diagnose");
 
 const EVENTSUB_WS_URL = "wss://eventsub.wss.twitch.tv/ws";
 const TWITCH_API_BASE_URL = "https://api.twitch.tv/helix";
@@ -20,7 +24,7 @@ const stateFile = path.resolve(process.cwd(), env.STATE_FILE || "./data/state.js
 
 if (!env.TWITCH_CLIENT_ID) throw new Error("TWITCH_CLIENT_ID is required.");
 if (!env.TWITCH_ACCESS_TOKEN) throw new Error("TWITCH_ACCESS_TOKEN is required.");
-if (!env.SLACK_WEBHOOK_URL) throw new Error("SLACK_WEBHOOK_URL is required.");
+if (!diagnosticOnly && !env.SLACK_WEBHOOK_URL) throw new Error("SLACK_WEBHOOK_URL is required.");
 if (broadcasterLogins.length === 0) throw new Error("TWITCH_BROADCASTERS must contain at least one login.");
 if (broadcasterLogins.length > MAX_BROADCASTERS) {
   throw new Error(`TWITCH_BROADCASTERS supports up to ${MAX_BROADCASTERS} broadcasters with current EventSub settings.`);
@@ -50,15 +54,38 @@ let resolvedBroadcasters = [];
 let liveReconcileTimer = null;
 let eventsubReady = false;
 let chatUserId = null;
+let instanceGuard = null;
+let diagnosticInFlight = null;
+let diagnosticReport = null;
+let diagnosticReportAt = null;
+let dashboard = null;
 
 main().catch((error) => {
   log("fatal", error instanceof Error ? error.stack || error.message : String(error));
+  if (dashboard) {
+    dashboard.close();
+    console.error(error instanceof Error ? error.message : String(error));
+  }
   process.exitCode = 1;
+  if (instanceGuard) instanceGuard.close().catch(() => {});
 });
 
 async function main() {
-  ensureStateDirectory(stateFile);
-  const initialState = loadState(stateFile, []);
+  if (!diagnosticOnly && process.argv.includes("--dashboard")) {
+    dashboard = startDashboard(() => ({
+      connection: !websocket ? "disconnected / reconnecting" : websocket.readyState === WebSocket.OPEN
+        ? websocket.subscriptionsReady ? "connected" : "registering" : "connecting",
+      report: diagnosticReport, reportAt: diagnosticReportAt,
+      broadcasters: resolvedBroadcasters.map(broadcaster => ({ ...broadcaster, live: state.broadcasters[broadcaster.id]?.live || false })),
+    }), { refresh: () => diagnoseSubscriptions(websocket?.eventsubSessionId || null) });
+    if (!dashboard) log("warn", "Dashboard requires an interactive terminal; using standard logs");
+  }
+  if (!diagnosticOnly) {
+    instanceGuard = await acquireInstanceGuard(config.twitchClientId, env.TWITCH_INSTANCE_PORT);
+    log("info", `Instance guard acquired: 127.0.0.1:${instanceGuard.port}`);
+  }
+  if (!diagnosticOnly) ensureStateDirectory(stateFile);
+  const initialState = diagnosticOnly ? state : loadState(stateFile, []);
   state.broadcasters = initialState.broadcasters;
   state.meta = initialState.meta;
   await ensureValidUserAccessToken();
@@ -67,10 +94,15 @@ async function main() {
     throw new Error("No broadcasters could be resolved from TWITCH_BROADCASTERS.");
   }
 
-  const hydratedState = loadState(stateFile, resolvedBroadcasters);
+  const hydratedState = diagnosticOnly ? state : loadState(stateFile, resolvedBroadcasters);
   state.broadcasters = hydratedState.broadcasters;
   state.meta = hydratedState.meta;
   log("info", `Resolved ${resolvedBroadcasters.length} broadcasters`);
+  if (diagnosticOnly) {
+    await diagnoseSubscriptions();
+    return;
+  }
+  await diagnoseSubscriptions().catch(error => log("warn", error.message));
   await hydrateInitialState();
   await cleanupManagedSubscriptions();
   await connect(EVENTSUB_WS_URL);
@@ -118,6 +150,7 @@ async function connect(url, previousSocket = null) {
       if (payload.metadata?.message_type === "session_welcome") {
         if (welcomed) return;
         welcomed = true;
+        socket.eventsubSessionId = payload.payload.session.id;
         if (previousSocket) {
           socket.previousSocket = null;
           previousSocket.close();
@@ -224,6 +257,7 @@ async function registerSubscriptions(sessionId, socket = websocket) {
   }
   if (socket !== websocket) return;
   eventsubReady = true;
+  void diagnoseSubscriptions(sessionId).catch(error => log("warn", error.message));
   if (retryDelayMs) {
     log("warn", `EventSub partially ready: ${socket.registeredSubscriptions.size}/${total}; retry in ${Math.ceil(retryDelayMs / 1000)}s. Check for another running instance or subscriptions sharing this Twitch application/user.`);
     clearTimeout(socket.subscriptionRetryTimer);
@@ -238,19 +272,7 @@ async function registerSubscriptions(sessionId, socket = websocket) {
 }
 
 async function cleanupManagedSubscriptions() {
-  const response = await twitchFetch(
-    `${TWITCH_API_BASE_URL}/eventsub/subscriptions`,
-    { headers: twitchHeaders() },
-    { retryOnUnauthorized: true }
-  );
-
-  if (!response.ok) {
-    const text = await response.text();
-    throw new Error(`Failed to list EventSub subscriptions: ${response.status} ${text}`);
-  }
-
-  const payload = await response.json();
-  const subscriptions = payload.data || [];
+  const { data: subscriptions } = await listSubscriptions(subscriptionListRequest);
   const managedTypes = new Set([...SUBSCRIPTION_TYPES, CHAT_SETTINGS_TYPE]);
   const managedBroadcasterIds = new Set(resolvedBroadcasters.map((b) => b.id));
 
@@ -258,6 +280,10 @@ async function cleanupManagedSubscriptions() {
     if (subscription.transport?.method !== "websocket") continue;
     if (!managedTypes.has(subscription.type)) continue;
     if (!managedBroadcasterIds.has(subscription.condition?.broadcaster_user_id)) continue;
+    if (subscription.status === "enabled") {
+      log("warn", `Preserving active subscription on another session: ${subscription.type}:${subscription.condition?.broadcaster_user_id} session=${subscription.transport?.session_id}`);
+      continue;
+    }
 
     const deleteResponse = await twitchFetch(
       `${TWITCH_API_BASE_URL}/eventsub/subscriptions?id=${subscription.id}`,
@@ -272,6 +298,27 @@ async function cleanupManagedSubscriptions() {
 
     log("info", `Deleted stale subscription: ${subscription.type}:${subscription.condition?.broadcaster_user_id}`);
   }
+}
+
+function subscriptionListRequest(url) {
+  return twitchFetch(url, { headers: twitchHeaders(), signal: AbortSignal.timeout(10000) }, { retryOnUnauthorized: !diagnosticOnly });
+}
+
+async function diagnoseSubscriptions(sessionId = null) {
+  if (diagnosticInFlight) return diagnosticInFlight;
+  diagnosticInFlight = (async () => {
+    const snapshot = await listSubscriptions(subscriptionListRequest);
+    const types = [...SUBSCRIPTION_TYPES, ...(chatUserId ? [CHAT_SETTINGS_TYPE] : [])];
+    const report = summarizeSubscriptions(snapshot, resolvedBroadcasters, types, sessionId, chatUserId);
+    diagnosticReport = report;
+    diagnosticReportAt = new Date().toLocaleTimeString();
+    log("info", `EventSub diagnostics: cost=${report.totalCost ?? "unknown"}/${report.maxTotalCost ?? "unknown"} total=${report.total ?? "unknown"} enabledWebSockets=${report.enabledWebSockets} (API totals may lag)`);
+    for (const row of report.subscriptions) log("info", `EventSub subscription: ${JSON.stringify(row)}`);
+    for (const row of report.coverage) log(row.status === "enabled" ? "info" : "warn", `EventSub coverage: ${JSON.stringify(row)}`);
+    if (!chatUserId) log("warn", "EventSub diagnostics: chat settings not requested; user:read:chat scope is missing");
+    return report;
+  })();
+  try { return await diagnosticInFlight; } finally { diagnosticInFlight = null; }
 }
 
 async function createSubscription(type, broadcasterUserId, sessionId) {
@@ -294,8 +341,17 @@ async function createSubscription(type, broadcasterUserId, sessionId) {
   );
 
   if (response.status === 409) {
-    log("info", `Subscription already exists: ${type}:${broadcasterUserId}`);
-    return;
+    const snapshot = await listSubscriptions(subscriptionListRequest);
+    const owned = snapshot.data.some(subscription => subscription.type === type && subscription.version === "1"
+      && subscription.condition?.broadcaster_user_id === broadcasterUserId
+      && (type !== CHAT_SETTINGS_TYPE || subscription.condition?.user_id === chatUserId)
+      && subscription.status === "enabled" && subscription.transport?.method === "websocket"
+      && subscription.transport.session_id === sessionId);
+    if (owned) return;
+    const error = new Error(`Subscription conflict on another session: ${type}:${broadcasterUserId}; inspect --diagnose and stop the other instance`);
+    error.status = 429;
+    error.retryDelayMs = 60000;
+    throw error;
   }
 
   if (!response.ok) {
@@ -319,6 +375,7 @@ async function reconnectTo(url) {
 async function ensureValidUserAccessToken() {
   let validation = await validateUserAccessToken();
   if (!validation.ok) {
+    if (diagnosticOnly) throw new Error(`Diagnostic token validation failed; renew the token using normal startup. ${validation.detail}`);
     if (!config.twitchRefreshToken) {
       throw new Error(`TWITCH_ACCESS_TOKEN is invalid and TWITCH_REFRESH_TOKEN is missing. ${validation.detail}`);
     }
@@ -337,7 +394,7 @@ async function ensureValidUserAccessToken() {
     throw new Error("TWITCH_ACCESS_TOKEN must be a User Access Token for EventSub WebSocket. App Access Tokens only work with webhook transport.");
   }
 
-  clearAuthFailureNotice();
+  if (!diagnosticOnly) clearAuthFailureNotice();
   chatUserId = validation.data.scopes?.includes("user:read:chat") ? validation.data.user_id : null;
   if (!chatUserId) log("warn", "Chat mode notifications disabled: reauthorize token with user:read:chat scope");
   log("info", `Validated user token for ${validation.data.login}`);
@@ -407,7 +464,7 @@ async function refreshUserAccessToken() {
 
 async function twitchFetch(url, options, settings = {}) {
   let response = await fetch(url, options);
-  if (response.status === 401 && settings.retryOnUnauthorized) {
+  if (response.status === 401 && settings.retryOnUnauthorized && !diagnosticOnly) {
     if (!config.twitchRefreshToken) return response;
 
     await refreshUserAccessToken();
@@ -1050,6 +1107,7 @@ function escapeMrkdwn(text) {
 }
 
 function log(level, message) {
+  if (dashboard) { dashboard.log(level, message); return; }
   console.log(`${new Date().toISOString()} [${level}] ${message}`);
 }
 

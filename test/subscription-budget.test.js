@@ -9,6 +9,7 @@ test("cost exhaustion preserves successful subscriptions and retries only missin
   const calls = [];
   let full = true;
   const context = vm.createContext({
+    async diagnoseSubscriptions() {},
     log() {}, clearTimeout() {},
     setTimeout(fn, ms) { timers.push({ fn, ms }); return timers.length; },
     async createSubscription(type, id) {
