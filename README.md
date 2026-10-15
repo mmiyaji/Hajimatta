@@ -1,247 +1,263 @@
-﻿# Hajimatta
+# Hajimatta
 
-Twitch 配信の開始とタイトル・カテゴリー更新を Slack に通知する最小 CLI です。
+Twitchの配信開始・配信情報・チャットモードの変更をSlackに通知するNode.js製CLIです。
+EventSub WebSocket（WS）でイベントを受信し、APIの定期確認で受信漏れを補完します。
+ターミナルでは、通常ログまたは固定画面のダッシュボードで監視できます。
 
-## 構成
+## はじめに
 
-- Twitch EventSub WebSocket に接続
-- 起動時に `Get Users` で Twitch login から user ID を解決
-- 起動時に `Get Streams` と `Get Channel Information` で初期状態を取得
-- 起動時に token を validate し、失効していれば refresh
-- Twitch API が `401` を返したら refresh して 1 回だけ自動リトライ
-- `stream.online` を受信したら即時通知
-- オフライン中の `channel.update` は配信予兆として通知
-- 開始直後の最初の `channel.update` は初期タイトル・カテゴリーとして別通知
-- 以後の `channel.update` は差分通知
-- 定期的に `Get Streams` で live 状態を補正
-- API 補正で終了を確認した場合は終了確認通知を送信
-- ローカルの `state.json` に最新状態を保持
-- `.env` の `TWITCH_ACCESS_TOKEN` と `TWITCH_REFRESH_TOKEN` を自動更新
-- Slack Incoming Webhook に投稿
+必要なものは、Node.js 20以上、TwitchアプリのClient IDとUser Access Token、
+SlackのIncoming Webhook URLです。監視対象は最大5チャンネルです。
 
-## 前提
-
-Node.js 20 以上を想定しています。
-
-Twitch EventSub WebSocket で購読を作るには、`User Access Token` が必要です。今回の構成では `stream.online` と `channel.update` だけを購読します。現在の EventSub WebSocket コスト制限に合わせて、監視対象は最大 5 人までです。
-
-多くの Twitch アプリでは token refresh に `Client Secret` が必要です。この README でも `TWITCH_CLIENT_SECRET` を使う前提で説明しています。
-
-参照:
-
-- https://dev.twitch.tv/docs/eventsub/manage-subscriptions/
-- https://dev.twitch.tv/docs/eventsub/eventsub-reference/
-- https://dev.twitch.tv/docs/api/reference#get-users
-- https://dev.twitch.tv/docs/api/reference#get-streams
-- https://dev.twitch.tv/docs/api/reference#get-channel-information
-- https://dev.twitch.tv/docs/authentication/register-app
-- https://dev.twitch.tv/docs/authentication/validate-tokens/
-- https://dev.twitch.tv/docs/authentication/refresh-tokens/
-- https://dev.twitch.tv/docs/authentication/getting-tokens-oauth/
-
-## 設定
-
-### Slack送信待ち・再試行・異常アラート
-
-Slack通知は送信前に `state.json` と同じフォルダーの `slack-outbox.json` に保存します。
-正常に送信できた通知だけを削除し、プロセス再起動後も未送信通知を再送します。
-`SLACK_OUTBOX_FILE` で保存先を変更できます。既存の `.env` に設定を追加する必要はありません。
-このファイルには通知本文とアラート状態が含まれ、Webhook URLやアクセストークンは保存しません。
-
-送信は1件ずつ、最低1秒間隔、リクエストのタイムアウトは10秒です。通信エラーや5xxは
-5秒から最大15分まで待ち時間を延ばして再試行します。429では `Retry-After` の間は
-送信全体を停止し、この待機状態も再起動後に引き継ぎます。400・403・404など設定や本文の
-修正が必要なエラーは通知を残して1時間おきに再試行し、他の通知の送信は継続します。
-ファイルが壊れている場合は上書きせず起動を停止します。稼働中の保存失敗は送信を停止し、
-ログとダッシュボードの `STOPPED` 表示で知らせます。空き容量・書き込み権限を確認してください。
-
-WebSocket接続、未購読・別接続の購読、Twitch API補完、購読診断、Slack送信の異常を監視します。
-通常は約1分継続した場合にSlackへ異常通知を送り、復旧を確認した場合にも通知します。
-認証更新の失敗・購読失効・起動失敗は即時に通知を作成します。同じ異常の再通知は
-標準2時間おきで、`TWITCH_AUTH_ALERT_INTERVAL_MS` で変更できます（最低1分）。
-未送信の同種アラートがある場合はまとめ、再起動後も通知の抑制状態を引き継ぎます。
-購読診断は1分おきに自動更新します。
-
-Slack自体への通信ができない間は、異常アラートも保存して通信復旧後に送ります。
-起動失敗でプロセスが終了した場合は、残った送信待ちは次回起動時に再送されます。
-プロセス停止中の監視・再送は行いません。ダッシュボードには送信待ち件数と再試行件数を表示します。
-Slack側で受信後に応答が失われた場合や、送信成功直後にプロセスが落ちた場合は、
-再送により重複する可能性があります。
-
-### 購読状況・コストの診断と二重起動防止
-
-固定画面のCUIで監視する場合は、対話型ターミナルで次を実行してください。
+既に設定済みの場合は、プロジェクトのフォルダーで次のコマンドを実行してください。
 
 ```bash
+npm install
 node src/index.js --dashboard
 ```
 
-WS接続状態、購読数、コスト、配信者の配信状態とイベント別購読状態を表示し、
-残りのウィンドウ高さをログ領域に使います。サイズ変更にも追従し、長いログは
-幅に合わせて折り返します。直近1000件を保持し、大きくした際には過去のログも再表示します。
-配信中は緑の `[LIVE]`、オフラインは灰色の `[OFF]`、購読正常は緑の `[OK]`、
-未購読は赤の `[MISS]`、別接続で購読中は黄色の `[OTHER]` で区別します。
-`r` で購読診断を更新、`q` または `Ctrl+C` で終了します。
-ログ表示は `1` でINFO以上、`2` でWARN以上、`3` でERROR以上（FATALを含む）に切り替えます。
-`l` でも INFO → WARN → ERROR の順に切り替えられます。初期表示はWARN以上です。
-非表示のレベルも含め直近1000件を保持するため、切り替えると過去のINFOも確認できます。
-`.env` の `DASHBOARD_LOG_LEVEL=info`（または `warn` / `error`）で起動時の表示レベルを指定できます。
-表示レベルの変更はSlack通知や通常ログモードに影響しません。
-コスト・購読状態は最後の診断結果で、確認時刻も表示します。
-パイプ・ファイル出力など対話型でない環境では通常ログに戻ります。
-通常の `npm start` は従来のログ形式です。
+更新時は旧プロセスを終了してから `git pull` し、再起動してください。
+設定や状態を引き継ぐには、同じ `.env` と `data/` を使います。
 
-一覧の `ELAPSED` は配信中なら配信開始からの時間、オフラインなら直近の終了確認からの時間です。
-1日以上は `2d 01:30:00` のように表示します。終了はAPIの定期確認で検出するため、
-オフラインの経過時間には概算を示す `~` が付きます。終了確認時刻は `state.json` に保存します。
-記録のない過去配信や停止中に終了した配信は `unknown` と表示し、終了時刻を推測しません。
+## 初期設定
 
-稼働中でも、別のターミナルから次のコマンドで診断できます。
+### 1. 依存パッケージをインストール
+
+```bash
+npm install
+```
+
+### 2. Twitchの認証情報を用意
+
+[Twitch Developer Console](https://dev.twitch.tv/console/apps)でアプリを登録し、Client IDを取得します。
+このCLIには、同じClient IDで発行した **User Access Token** が必要です。
+App Access TokenではEventSubのWS購読は作成できません。
+
+付属のトークン取得スクリプトはDevice Codeフローを使います。PowerShellで実行してください。
+
+```powershell
+./get-twitch-user-token.ps1 -ClientId "YOUR_TWITCH_CLIENT_ID"
+```
+
+表示されたURLをブラウザで開いてコードを入力し、権限を承認します。
+スクリプトに戻ってEnterを押すとAccess TokenとRefresh Tokenが表示されます。
+このスクリプトは `.env` を自動更新しないため、次の手順で両方を設定してください。
+
+標準で要求する `user:read:chat` は、チャットモード変更をWSで受信するための権限です。
+この権限がなくても、30秒ごとのAPI確認でチャットモードの変更を補完します。
+
+Client IDを変更した場合は、Access TokenとRefresh Tokenも取り直してください。
+Client Secretが必要かどうかはTwitchアプリの認証方式によります。
+更新時に `missing client secret` が出た場合は、そのアプリのClient Secretを設定してください。
+
+### 3. `.env` を作成
+
+`.env.example` をコピーするか、次の内容で `.env` を作成します。
+監視対象には表示名ではなく、チャンネルURL末尾のlogin名を指定してください。
+
+```env
+TWITCH_CLIENT_ID=your_twitch_client_id
+TWITCH_CLIENT_SECRET=your_twitch_client_secret_if_required
+TWITCH_ACCESS_TOKEN=your_user_access_token
+TWITCH_REFRESH_TOKEN=your_refresh_token
+TWITCH_BROADCASTERS=nikopyonzoku
+SLACK_WEBHOOK_URL=https://hooks.slack.com/services/XXX/YYY/ZZZ
+```
+
+複数チャンネルの場合は `TWITCH_BROADCASTERS=channel_one,channel_two` のようにカンマで区切ります。
+Client Secretが不要なアプリでは、`TWITCH_CLIENT_SECRET` の行を省略するか空欄にしてください。
+
+`.env` はプロジェクトのフォルダーから読み込みます。同名の環境変数がある場合は、環境変数が優先されます。
+`.env`、そのコピー、トークン、Webhook URLはGitやチャットに貼り付けないでください。
+
+### 4. 起動
+
+| 用途 | コマンド |
+| --- | --- |
+| 固定画面のダッシュボード | `node src/index.js --dashboard` |
+| 通常ログで監視 | `npm start` |
+| 購読状況の診断だけ実行 | `node src/index.js --diagnose` |
+
+監視はプロセスが動いている間だけ行います。通常ログモードでは `Ctrl+C`、
+ダッシュボードでは `q` または `Ctrl+C` で終了します。
+
+## ダッシュボードの見方
+
+### チャンネル一覧
+
+| 列 | 意味 |
+| --- | --- |
+| `CHANNEL` | 監視対象のチャンネル名 |
+| `STREAM` | 緑の `[LIVE]` は配信中、灰色の `[OFF]` はオフライン |
+| `ELAPSED` | 配信中は開始からの経過時間。オフライン時は前回の終了確認からの概算時間 |
+| `ONLINE` | 配信開始イベントのWS購読状態 |
+| `UPDATE` | タイトル・カテゴリ更新イベントのWS購読状態 |
+| `CHAT` | チャット設定変更イベントのWS購読状態 |
+| `EMOTES` | 水色の `[EMOTE]` はスタンプ限定が有効、灰色の `[TEXT]` は無効。`[?]` は未確認 |
+| `CATEGORY` / `TITLE` | 配信中のカテゴリとタイトル。オフライン時は空欄 |
+
+**`CHAT [OK]` は購読成功を示す表示です。スタンプ限定の状態は `EMOTES` 列で確認してください。**
+`[TEXT]` はスタンプ限定が無効という意味で、フォロワー限定など他の制限がないことを示す表示ではありません。
+
+WS購読状態は、緑の `[OK]` が有効、赤の `[MISS]` が未購読、黄色の `[OTHER]` が別接続で有効です。
+`[?]` は未確認、`-` はそのイベントを購読対象にしていないことを表します。
+
+一覧は1行ずつ表示し、幅に収まらない部分は折り返さず切り詰めます。
+ログは一覧の下に空行を挟んで表示し、ウィンドウの高さに合わせて表示件数を調整します。
+長いログは折り返し、直近1000件をメモリに保持します。再起動するとこのログ履歴は消えます。
+
+### キー操作とログレベル
+
+| キー | 操作 |
+| --- | --- |
+| `1` | INFO以上を表示 |
+| `2` | WARN以上を表示（初期値） |
+| `3` | ERROR以上を表示。FATALも含む |
+| `l` | INFO → WARN → ERRORの順に切り替え |
+| `r` | 購読診断を手動更新 |
+| `q` / `Ctrl+C` | 終了 |
+
+表示していないレベルも履歴に保持するため、後からINFOに切り替えて確認できます。
+表示レベルはSlack通知に影響しません。起動時のレベルは `DASHBOARD_LOG_LEVEL` で指定できます。
+対話型ターミナル以外に出力する場合は、通常ログに切り替わります。
+
+### 経過時間と再起動
+
+配信中はAPIまたはイベントで取得した開始時刻から計算します。
+オフライン時は、APIで終了を確認した時刻から計算するため、`~2d 01:30:00` のように `~` が付きます。
+終了確認は標準2分間隔なので、実際の終了時刻とはずれます。
+
+終了確認時刻は `state.json` に保存し、再起動後も引き継ぎます。
+保存上は配信中だったチャンネルが、再起動時にはオフラインだった場合、終了時刻は推測せず `unknown` にします。
+停止中に開始・終了の両方があった配信は検知できず、以前保存した終了確認時刻が残る場合があります。
+
+## 通知と更新タイミング
+
+| 対象 | 検知・確認のタイミング | 動作 |
+| --- | --- | --- |
+| 配信開始 | WS受信時。受信漏れはAPIで標準2分ごとに補完 | 開始通知を作成 |
+| タイトル・カテゴリ | WS受信時 | 変更を通知。オフライン中の変更も対象 |
+| 配信開始直後の情報 | 開始後の最初の情報更新イベント受信時 | 初期タイトル・カテゴリとして別通知 |
+| 配信終了 | APIで標準2分ごとに確認 | 終了確認通知を作成 |
+| チャットモード | WS受信時。起動時と30秒ごとのAPI確認でも補完 | 前回確認した設定との差分を通知 |
+| 購読状況・コスト | 起動時・購読登録後・1分ごと。`r` でも更新 | ダッシュボードと診断ログに反映 |
+
+画面は毎秒再描画しますが、APIのデータを毎秒取得するわけではありません。
+通知の作成後、Slack送信待ちに保存して順次送信します。
+配信開始通知とタイトル・カテゴリの更新通知は、別々に届く場合があります。
+
+### スタンプ限定モードの開始・解除
+
+配信がオフラインでも監視します。フォロワー限定、サブスク限定、スローモード、
+重複メッセージ制限も対象で、待機時間の変更にも対応しています。
+
+通知には `EventSub` または `API補完` の検知経路を付けます。
+受信と送信待ちへの登録は、INFOログの `Chat settings received` と `Chat mode notification queued` で確認できます。
+これらはSlackへの送信完了を示すログではありません。完了は `Slack notification delivered` で確認します。
+
+初回のAPI確認では、スタンプ限定が有効なら「現在有効」と通知し、無効なら比較基準の保存だけを行います。
+保存済みの設定がある場合は、その設定との差分を通知します。
+30秒以内に開始・解除の両方が起きると、API補完だけでは途中の変更を検知できません。
+
+## Slack送信の再試行と異常アラート
+
+通知は送信前に `slack-outbox.json` に保存し、正常に送信できたものだけを削除します。
+失敗した通知は再試行し、再起動後も未送信通知を再送します。
+
+| 送信結果 | 再試行の動作 |
+| --- | --- |
+| 通信エラー・5xx | 5秒から最大15分まで待ち時間を延ばす |
+| 429 | `Retry-After` に従って送信全体を待機。待機状態も保存 |
+| 400・403・404など（408と429を除く4xx） | 通知を残して1時間おきに再試行。他の通知は送信を継続 |
+
+送信は1件ずつ最低1秒間隔、タイムアウトは10秒です。ダッシュボードの `pending` は送信待ち件数、
+`retrying` は送信失敗歴のある待機通知の件数です。Slackが受信後に応答だけ失われた場合などは、再送で重複する可能性があります。
+
+接続・購読・API確認・Slack送信の異常が約1分続くとアラートを作成し、復旧時も通知します。
+認証更新失敗・購読失効・起動失敗は即時に通知を作成します。ただし、起動がごく初期で失敗した場合や
+送信待ちファイル自体を開けない場合など、アラートを保存できないこともあります。
+同じ異常は標準2時間おきに再通知し、未送信の同種アラートがある場合はまとめます。
+
+Slack自体に送れない間はアラートも保存し、通信復旧後に送ります。
+プロセス停止中の監視・再送は行いません。起動失敗で終了した場合、残った通知は次回起動時に再送します。
+
+## 設定項目
+
+相対パスは、起動時の作業フォルダーを基準に解決します。時間の設定値はミリ秒です。
+
+| 設定名 | 用途・初期値 |
+| --- | --- |
+| `TWITCH_CLIENT_ID` | 必須。TwitchアプリのClient ID |
+| `TWITCH_ACCESS_TOKEN` | 必須。同じClient IDで発行したUser Access Token |
+| `TWITCH_REFRESH_TOKEN` | トークンの自動更新に使用 |
+| `TWITCH_CLIENT_SECRET` | アプリの認証方式に応じて自動更新に必要 |
+| `TWITCH_BROADCASTERS` | 必須。login名をカンマ区切りで指定。最大5人 |
+| `SLACK_WEBHOOK_URL` | 監視時は必須。単独診断では不要 |
+| `DASHBOARD_LOG_LEVEL` | ダッシュボードの初期表示。`info` / `warn` / `error`。初期値 `warn` |
+| `STATE_FILE` | 状態の保存先。初期値 `./data/state.json` |
+| `SLACK_OUTBOX_FILE` | 送信待ちの保存先。初期値は状態ファイルと同じフォルダーの `slack-outbox.json` |
+| `LIVE_RECONCILE_INTERVAL_MS` | 配信状態のAPI確認間隔。初期値 `120000`（2分） |
+| `LIVE_RECONCILE_LOG_MODE` | 配信状態の補完ログ。`changes`（初期値）は変化時だけ、`verbose` は毎回、`silent` は補完の案内ログを抑止 |
+| `SLACK_MESSAGE_MODE` | `aligned`（初期値）はプッシュ通知と本文の内容を揃える。`legacy` はプッシュ通知を短い見出しにする |
+| `TWITCH_AUTH_ALERT_INTERVAL_MS` | 異常アラート全般の再通知間隔。初期値 `7200000`（2時間）、最低1分 |
+| `TWITCH_INSTANCE_PORT` | 二重起動防止用のローカルポート。通常はClient IDから自動決定。競合時のみ1024〜65535の空きポートを指定 |
+
+チャット設定のAPI確認は30秒、購読診断は1分で固定です。
+起動時とTwitch APIの401応答時にトークンを確認・更新し、更新に成功すると `.env` の値も書き換えます。
+`.env` がない場合は実行中の値だけを更新します。
+
+## 診断とトラブル対応
+
+監視中でも、別のターミナルから実行できます。
 
 ```bash
 node src/index.js --diagnose
 ```
 
-総コストと上限、有効な WebSocket 接続数、各購読の種類・配信者ID・状態・コスト・
-セッションIDを出力します。監視対象ごとの `EventSub coverage` は `enabled`（有効）、
-`other_session`（別接続で有効）、`missing`（未購読）です。単独診断には自分の接続がないため、
-既存の有効な接続を `enabled` と表示します。トークンやWebhookの秘密情報は出力しません。
-APIのコスト集計は反映に数秒かかる場合があります。
+総コスト・上限、有効な接続数、購読ごとの配信者ID・状態・コスト・セッションIDを出力します。
+`enabled` は有効、`other_session` は別接続で有効、`missing` は未購読です。
+単独診断は自分の接続を持たないため、既存の有効な購読を `enabled` と表示します。
+APIのコスト集計には数秒の遅延がある場合があります。
 
-通常起動時と購読登録後（429による再試行時を含む）にも自動で診断します。
-別接続で有効な購読を起動時に削除せず、409の競合も自分の接続での購読成功と区別します。
-`--diagnose` は購読変更・Slack送信・トークン更新を行いません。トークンが無効な場合は、
-通常起動で更新してから再実行してください。Slackの設定は単独診断には不要です。
+単独診断は購読変更・Slack送信・トークン更新を行いません。トークンが無効なら、
+通常起動で更新するか再取得してから実行してください。
 
-通常起動では、Client IDから決まるローカル専用ポートを占有して、同じPCの同じClient IDでの
-二重起動を防ぎます。別フォルダーからの起動も対象です。終了・クラッシュ時はOSが解放するため、
-ロックファイルの削除は不要です。既に動作中の旧版にはこの防止機能がないため、更新時は旧プロセスを停止してください。
-別PC・コンテナなどネットワーク環境を分けたプロセス間は防止できません。
+| 症状 | 確認すること |
+| --- | --- |
+| コスト上限・429 | 診断の購読一覧を確認。同じClient ID・ユーザーで別のプロセスが動いていないか確認 |
+| `CHAT [OK]` だがスタンプ限定の表示が不明 | `EMOTES` 列とINFOログを確認。CHATはモードではなく購読状態 |
+| Slack通知が来ない | `pending`・`retrying`、`Slack delivery deferred`、Webhook設定とネットワークを確認 |
+| `STOPPED` が表示される | 送信待ちファイルの保存失敗。ディスク容量・権限を直し、再起動 |
+| 送信待ちファイルが壊れている | 起動を停止し、ファイルを保全して修復。通知を捨てる前提で安易に削除しない |
+| 画面の右側が見えない | ターミナルの幅を広げる。一覧は折り返さず表示 |
+| ログが増えない | 初期表示はWARN以上。`1` でINFOも表示する |
+| チャンネルを解決できない | 表示名ではなくlogin名を指定しているか確認 |
 
-無関係なアプリとポートが競合する場合だけ、`.env` に `TWITCH_INSTANCE_PORT=任意の空きポート`
-（1024〜65535）を設定できます。同じClient IDを使う全コピーに同じ値を設定してください。
+同じPC・Client IDの二重起動は、ローカルポートの占有で防止します。
+別フォルダーからの起動も対象ですが、別PCやネットワークを分離したコンテナ間は対象外です。
+ポートを手動指定する場合は、同じClient IDを使う全コピーで同じ値を指定してください。
+別接続の有効な購読は自動削除しません。古いプロセスを終了してから再起動してください。
 
-### チャットのモード変更通知
+## 保存ファイルと検証
 
-`user:read:chat` 権限付きの User Access Token がある場合、監視対象の
-`channel.chat_settings.update` を追加購読します。スタンプ限定モードの開始・解除、
-フォロワー限定・サブスク限定・スローモード・重複メッセージ制限の変更を Slack に通知します。
-スローモードとフォロワー限定の待機時間変更も通知します。
-権限がない既存トークンではWSチャット購読は無効になりますが、下記のAPI補完で監視を継続します。
+- `.env`：認証情報と設定。自動更新でトークンが書き換わります。
+- `data/state.json`：配信状態、終了確認時刻、チャット設定など。`STATE_FILE` で変更可能です。
+- `data/slack-outbox.json`：送信待ち本文とアラート状態。`SLACK_OUTBOX_FILE` で変更可能です。
 
-追加権限を承認するには、次のコマンドでトークンを再取得してください。
-
-```powershell
-./get-twitch-user-token.ps1 -ClientId YOUR_CLIENT_ID
-```
-
-ブラウザで Twitch の権限を承認し、表示された Access Token / Refresh Token を
-稼働環境の `.env` に反映してプロセスを再起動してください。スクリプトは標準で
-`user:read:chat` を要求します。トークンをチャットや Git に貼り付けないでください。
-
-前回の設定を `state.json` に保存して差分を通知します。起動時と30秒ごとに `Get Chat Settings`
-でも設定を取得し、WSの受信漏れや未購読時の開始・解除を補完します。このAPI補完には
-追加権限やモデレーター権限は不要です。通知には検知経路（EventSub／API補完）を付けます。
-初回のAPI確認は比較基準として保存し、既にスタンプ限定が有効なら「現在有効」と通知します。
-WS受信とAPI確認の同じ差分は二重通知せず、取得中にWSイベントが来た場合はAPI結果を捨てます。
-30秒以内に開始と解除の両方が起きた場合、API確認だけでは途中の変更を検知できません。
-
-一覧の `CHAT` はWS購読状態、`EMOTES` は最後に確認したモードです。
-`[EMOTE]` はスタンプ限定有効、`[TEXT]` はスタンプ限定無効、`[?]` は未確認を示します。
-受信・通知作成は `Chat settings received` / `Chat mode notification queued` のログで確認できます。
-
-参照: https://dev.twitch.tv/docs/eventsub/eventsub-subscription-types/#channelchat_settingsupdate
-
-API補完: https://dev.twitch.tv/docs/api/reference/#get-chat-settings
-
-`.env.example` を元に `.env` を作ります。
-
-```env
-TWITCH_CLIENT_ID=your_twitch_client_id
-TWITCH_CLIENT_SECRET=your_twitch_client_secret
-TWITCH_ACCESS_TOKEN=your_user_access_token
-TWITCH_REFRESH_TOKEN=your_refresh_token
-SLACK_WEBHOOK_URL=https://hooks.slack.com/services/XXX/YYY/ZZZ
-SLACK_MESSAGE_MODE=aligned
-TWITCH_BROADCASTERS=erumdoor,kingofsimoyaka,foo,bar,baz
-STATE_FILE=./data/state.json
-LIVE_RECONCILE_INTERVAL_MS=120000
-LIVE_RECONCILE_LOG_MODE=changes
-TWITCH_AUTH_ALERT_INTERVAL_MS=7200000
-```
-
-`LIVE_RECONCILE_INTERVAL_MS` ????????????? `120000` ? 2 ???? API ????????? 
-`LIVE_RECONCILE_LOG_MODE` は定期 API 補正ログの出し方です。`changes` がデフォルトで、状態変化があった周期だけ要約ログを出します。`verbose` は毎周期、`silent` は開始時ログも含めて抑止します。
-`SLACK_MESSAGE_MODE` は Slack の `text` と `blocks` の揃え方です。デフォルトの `aligned` はスマホ通知と本文をできるだけ一致させます。`legacy` にすると従来どおり `text` は短い見出し、本文は `blocks` になります。
-
-`TWITCH_BROADCASTERS` は Twitch の login 名のカンマ区切りです。起動時に `Get Users` API で user ID を自動解決します。
-
-## Twitch アプリ登録
-
-1. [Twitch Developer Console](https://dev.twitch.tv/console/apps) でアプリを作成します。
-2. `Client Type` は通常 `Confidential` を選びます。
-3. `OAuth Redirect URLs` は登録上必要ですが、この CLI 自体は redirect を使いません。未使用の HTTPS URL を 1 つ入れれば十分です。
-4. 作成後に `Client ID` を控えます。
-5. `Manage` から `New Secret` を作成して `Client Secret` を控えます。
-
-`.env` には `TWITCH_CLIENT_ID` と `TWITCH_CLIENT_SECRET` を設定してください。
-
-## User Access Token の取得
-
-新しい `Client ID` に切り替えた場合は、`Access Token` と `Refresh Token` も取り直してください。token は発行時の `Client ID` に紐づきます。
-
-`get-twitch-user-token.ps1` を使う場合の例:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\get-twitch-user-token.ps1 -ClientId "YOUR_TWITCH_CLIENT_ID"
-```
-
-取得後は `.env` を更新します。
-
-```env
-TWITCH_CLIENT_ID=...
-TWITCH_CLIENT_SECRET=...
-TWITCH_ACCESS_TOKEN=...
-TWITCH_REFRESH_TOKEN=...
-```
-
-## 実行
+送信待ちにはWebhook URLやアクセストークンを保存しません。ただし、通知本文を含むため適切に管理してください。
+状態と送信待ちの保存先は、プロセスから書き込める場所にします。
+このREADMEはUTF-8です。編集時もUTF-8で保存してください。
 
 ```bash
-npm start
+npm run check
+node --test test/*.test.js
 ```
 
-起動時には次のようなログが出ます。
+## Twitch・Slackの公式資料
 
-- `Hydrated initial state: broadcasters=5 live=2`
-- `Initial live broadcasters: login=... title=... category=... url=...`
-- `Starting live reconcile loop: intervalMs=120000 intervalSec=120`
-- `Running live reconcile check for 5 broadcasters`
-- `Live reconcile completed: currentLive=1 reconciledOnline=0 reconciledOffline=1 changed=true`
-
-## 自動 refresh
-
-- 起動時に `TWITCH_ACCESS_TOKEN` を validate
-- 無効なら `TWITCH_REFRESH_TOKEN` で refresh
-- refresh 成功後は `.env` の token 値を更新
-- 実行中に Twitch API が `401` を返した場合も 1 回だけ自動 refresh
-- あなたのアプリで `missing client secret` が出る場合は `TWITCH_CLIENT_SECRET` を `.env` に入れてください
-
-## 通知仕様
-
-- 配信開始: 即時に Slack 通知
-- 配信予兆: オフライン中のタイトル変更やカテゴリー変更を Slack 通知
-- 初期配信情報: 開始直後の最初の `channel.update` を Slack 通知
-- 配信情報更新: 配信中のタイトル変更やカテゴリー変更を Slack 通知
-- 配信終了確認: API 補正で配信終了を確認した場合に Slack 通知
-- Slack 本文には Twitch プロフィール画像を添付
-- タイトルとカテゴリーが同時に変わった場合は 1 件にまとめて通知
-
-## 制限
-
-- 監視対象は最大 5 人までです。
-- 開始通知は即時送信されるため、タイトルとカテゴリーは後続の初期更新通知で届くことがあります。
-- 終了通知は `stream.offline` ではなく API 補正ベースです。通知タイミングは `LIVE_RECONCILE_INTERVAL_MS` に依存します。
-- login 名を解決できない Twitch ユーザーが含まれていると起動時にエラーになります。
-- Slack は Incoming Webhook 前提です。
-- `.env` が存在しない場合は token を自動保存しません。
+- [EventSubの購読管理とコスト](https://dev.twitch.tv/docs/eventsub/manage-subscriptions/)
+- [EventSubのイベント一覧](https://dev.twitch.tv/docs/eventsub/eventsub-subscription-types/)
+- [チャット設定取得API](https://dev.twitch.tv/docs/api/reference/#get-chat-settings)
+- [Twitchのトークン取得](https://dev.twitch.tv/docs/authentication/getting-tokens-oauth/)
+- [Twitchのトークン更新](https://dev.twitch.tv/docs/authentication/refresh-tokens/)
+- [Slack Incoming Webhook](https://docs.slack.dev/messaging/sending-messages-using-incoming-webhooks/)
