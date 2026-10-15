@@ -98,9 +98,24 @@ test("table columns align for different names, stream states and subscription st
   assert.equal(table[0].trim().startsWith("CHANNEL"), true);
   assert.deepEqual(separators(table[0]), separators(table[1]));
   assert.deepEqual(separators(table[0]), separators(table[2]));
-  assert.equal(table[1].length, table[2].length);
   assert.match(table[1], /\[LIVE\]/);
   assert.match(table[2], /\[OFF\]/);
+});
+
+test("live rows show category and title on one clipped line, offline rows hide stale details", () => {
+  const snapshot = { broadcasters: [
+    { id: "1", login: "streamer", live: true, categoryName: "Just Chatting", title: "配信タイトル".repeat(30) },
+    { id: "2", login: "offline", live: false, categoryName: "Old category", title: "Old title" },
+  ] };
+  const wide = dashboardLines(snapshot, [], { width: 140, height: 24 });
+  assert.match(wide[6], /CATEGORY\s+\| TITLE/);
+  assert.match(wide[7], /Just Chatting\s+\| 配信タイトル/);
+  assert.ok(!wide[8].includes("Old category"));
+  assert.ok(!wide[8].includes("Old title"));
+  const narrow = dashboardLines(snapshot, [], { width: 90, height: 24 });
+  assert.equal(narrow.length, wide.length);
+  assert.match(narrow[8], /offline/);
+  assert.ok([...narrow[7]].reduce((sum, char) => sum + (char.codePointAt(0) > 127 ? 2 : 1), 0) <= 90);
 });
 
 test("shorter redraws erase previous characters from every terminal row", () => {

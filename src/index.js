@@ -76,7 +76,10 @@ async function main() {
       connection: !websocket ? "disconnected / reconnecting" : websocket.readyState === WebSocket.OPEN
         ? websocket.subscriptionsReady ? "connected" : "registering" : "connecting",
       report: diagnosticReport, reportAt: diagnosticReportAt,
-      broadcasters: resolvedBroadcasters.map(broadcaster => ({ ...broadcaster, live: state.broadcasters[broadcaster.id]?.live || false })),
+      broadcasters: resolvedBroadcasters.map(broadcaster => {
+        const current = state.broadcasters[broadcaster.id];
+        return { ...broadcaster, live: current?.live || false, title: current?.title || "", categoryName: current?.categoryName || "" };
+      }),
     }), { refresh: () => diagnoseSubscriptions(websocket?.eventsubSessionId || null) });
     if (!dashboard) log("warn", "Dashboard requires an interactive terminal; using standard logs");
   }

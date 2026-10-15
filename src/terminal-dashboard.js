@@ -21,8 +21,8 @@ function tableCell(value, width) {
   return text + " ".repeat(Math.max(0, width - cells));
 }
 
-function channelRow(name, stream, online, update, chat) {
-  return [tableCell(name, 20), tableCell(stream, 6), ...[online, update, chat].map(value => tableCell(value, 7))].join(" | ");
+function channelRow(name, stream, online, update, chat, category = "", title = "") {
+  return [tableCell(name, 20), tableCell(stream, 6), ...[online, update, chat].map(value => tableCell(value, 7)), tableCell(category, 20), clean(title)].join(" | ");
 }
 
 function dashboardLines(snapshot, recent = [], { height = 24, width = 99 } = {}) {
@@ -36,14 +36,16 @@ function dashboardLines(snapshot, recent = [], { height = 24, width = 99 } = {})
     "Cost and coverage reflect the last API check; totals may lag.",
     report ? `Last API check: ${snapshot.reportAt || "-"}` : "Waiting for subscription diagnostics...",
     "",
-    channelRow("CHANNEL", "STREAM", "ONLINE", "UPDATE", "CHAT"),
+    channelRow("CHANNEL", "STREAM", "ONLINE", "UPDATE", "CHAT", "CATEGORY", "TITLE"),
     ...(snapshot.broadcasters || []).map(broadcaster => {
       const statuses = { enabled: "[OK]", missing: "[MISS]", other_session: "[OTHER]" };
       const events = ["stream.online", "channel.update", "channel.chat_settings.update"].map(type => {
         const row = coverage.find(row => row.broadcasterId === broadcaster.id && row.type === type);
         return row ? statuses[row.status] || "[?]" : report ? "-" : "[?]";
       });
-      return channelRow(broadcaster.login, broadcaster.live ? "[LIVE]" : "[OFF]", ...events);
+      return channelRow(broadcaster.login, broadcaster.live ? "[LIVE]" : "[OFF]", ...events,
+        broadcaster.live ? broadcaster.categoryName || "-" : "",
+        broadcaster.live ? broadcaster.title || "-" : "");
     }),
   ].map(line => wrapLine(line, width)[0]);
   const fixed = [...header, ""].slice(0, Math.max(0, height - 2));
