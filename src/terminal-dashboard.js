@@ -46,7 +46,7 @@ function dashboardLines(snapshot, recent = [], { height = 24, width = 99 } = {})
       return channelRow(broadcaster.login, broadcaster.live ? "[LIVE]" : "[OFF]", ...events);
     }),
   ].map(line => wrapLine(line, width)[0]);
-  const fixed = header.slice(0, Math.max(0, height - 2));
+  const fixed = [...header, ""].slice(0, Math.max(0, height - 2));
   const capacity = Math.max(0, height - fixed.length - 1);
   const logs = recent.length ? recent.flatMap(line => wrapLine(line, width)).slice(-capacity) : ["(none)"];
   const lines = [...fixed, "RECENT WARNINGS / ERRORS (newest at bottom)", ...logs].slice(0, height);
