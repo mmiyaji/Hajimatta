@@ -10,7 +10,7 @@ test("fixed view includes connection, cost, coverage and sanitized warnings", ()
   }, broadcasters: [{ id: "1", login: "channel", live: true }] }, ["error\x1b[2J\nmessage"]);
   const text = lines.join("\n");
   assert.match(text, /Cost: 10\/10/);
-  assert.match(text, /\[LIVE\] channel \| online\[OTHER\]/);
+  assert.match(text, /channel\s+\| \[LIVE\]\s+\| \[OTHER\]/);
   assert.equal(lines.some(line => /[\x00-\x1f]/.test(line)), false);
 });
 
@@ -85,4 +85,50 @@ test("resize redraws immediately, restores history, and colors status markers", 
     assert.equal(frames.at(-1).split("\r\n").length, 45);
   } finally { dashboard.close(); }
   assert.equal(output.listenerCount("resize"), 0);
+});
+
+test("table columns align for different names, stream states and subscription states", () => {
+  const broadcasters = [{ id: "1", login: "a", live: true }, { id: "2", login: "long_channel_name", live: false }];
+  const report = { coverage: broadcasters.flatMap(b => ["stream.online", "channel.update", "channel.chat_settings.update"].map((type, i) => ({
+    broadcasterId: b.id, type, status: ["enabled", "missing", "other_session"][i],
+  }))) };
+  const lines = dashboardLines({ broadcasters, report }, [], { width: 99, height: 24 });
+  const table = lines.slice(6, 9);
+  const separators = line => [...line.matchAll(/\|/g)].map(match => match.index);
+  assert.equal(table[0].trim().startsWith("CHANNEL"), true);
+  assert.deepEqual(separators(table[0]), separators(table[1]));
+  assert.deepEqual(separators(table[0]), separators(table[2]));
+  assert.equal(table[1].length, table[2].length);
+  assert.match(table[1], /\[LIVE\]/);
+  assert.match(table[2], /\[OFF\]/);
+});
+
+test("shorter redraws erase previous characters from every terminal row", () => {
+  const input = new EventEmitter();
+  Object.assign(input, { isTTY: true, isRaw: false, isPaused: () => true,
+    setRawMode(value) { this.isRaw = value; }, resume() {}, pause() {} });
+  const output = new EventEmitter();
+  const frames = [];
+  Object.assign(output, { isTTY: true, rows: 24, columns: 100, write(text) { frames.push(text); } });
+  const snapshot = { connection: "disconnected / reconnecting", broadcasters: [{ id: "1", login: "channel", live: true }],
+    report: { coverage: [{ broadcasterId: "1", type: "stream.online", status: "missing" }] } };
+  const dashboard = startDashboard(() => snapshot, { input, output, quit() {} });
+  // Model overwrite semantics: writing a shorter line does not erase its old tail.
+  const apply = (previous, frame) => frame.replace(/^\x1b\[H/, "").replace(/\x1b\[J$/, "").split("\r\n").map((line, i) => {
+    const erased = line.startsWith("\x1b[2K");
+    const text = line.replace(/\x1b\[(?:2K|[\d;]*m)/g, "");
+    return text + (erased ? "" : (previous[i] || "").slice(text.length));
+  });
+  try {
+    const oldRows = apply([], frames.at(-1));
+    snapshot.connection = "connected";
+    snapshot.broadcasters[0].live = false;
+    snapshot.report.coverage[0].status = "enabled";
+    output.emit("resize");
+    const rows = apply(oldRows, frames.at(-1));
+    assert.ok(rows[1].endsWith("WS: connected"));
+    assert.ok(!rows.join("\n").includes("[MISS]"));
+    assert.ok(!rows.join("\n").includes("[LIVE]"));
+    assert.ok(frames.at(-1).split("\r\n").slice(1).every(line => line.startsWith("\x1b[2K")));
+  } finally { dashboard.close(); }
 });

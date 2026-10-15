@@ -15,6 +15,16 @@ function wrapLine(value, width) {
   return lines;
 }
 
+function tableCell(value, width) {
+  const text = wrapLine(value, width)[0];
+  const cells = [...text].reduce((sum, char) => sum + (/\p{Mark}/u.test(char) ? 0 : char.codePointAt(0) > 127 ? 2 : 1), 0);
+  return text + " ".repeat(Math.max(0, width - cells));
+}
+
+function channelRow(name, stream, online, update, chat) {
+  return [tableCell(name, 20), tableCell(stream, 6), ...[online, update, chat].map(value => tableCell(value, 7))].join(" | ");
+}
+
 function dashboardLines(snapshot, recent = [], { height = 24, width = 99 } = {}) {
   const report = snapshot.report;
   const coverage = report?.coverage || [];
@@ -26,13 +36,14 @@ function dashboardLines(snapshot, recent = [], { height = 24, width = 99 } = {})
     "Cost and coverage reflect the last API check; totals may lag.",
     report ? `Last API check: ${snapshot.reportAt || "-"}` : "Waiting for subscription diagnostics...",
     "",
-    "CHANNEL | STREAM | EVENT SUBSCRIPTIONS",
+    channelRow("CHANNEL", "STREAM", "ONLINE", "UPDATE", "CHAT"),
     ...(snapshot.broadcasters || []).map(broadcaster => {
-      const labels = { "stream.online": "online", "channel.update": "update", "channel.chat_settings.update": "chat" };
       const statuses = { enabled: "[OK]", missing: "[MISS]", other_session: "[OTHER]" };
-      const events = coverage.filter(row => row.broadcasterId === broadcaster.id)
-        .map(row => `${labels[row.type] || row.type}${statuses[row.status] || "[?]"}`).join(" ");
-      return `${broadcaster.live ? "[LIVE]" : "[OFF]"} ${clean(broadcaster.login).slice(0, 20)} | ${events || "checking"}`;
+      const events = ["stream.online", "channel.update", "channel.chat_settings.update"].map(type => {
+        const row = coverage.find(row => row.broadcasterId === broadcaster.id && row.type === type);
+        return row ? statuses[row.status] || "[?]" : report ? "-" : "[?]";
+      });
+      return channelRow(broadcaster.login, broadcaster.live ? "[LIVE]" : "[OFF]", ...events);
     }),
   ].map(line => wrapLine(line, width)[0]);
   const fixed = header.slice(0, Math.max(0, height - 2));
@@ -59,7 +70,8 @@ function startDashboard(getSnapshot, { input = process.stdin, output = process.s
     const height = Math.max(1, output.rows || 24);
     const width = Math.max(1, (output.columns || 100) - 1);
     const lines = dashboardLines(getSnapshot(), recent, { height, width });
-    output.write(`\x1b[H${lines.map(colorize).join("\r\n")}\x1b[J`);
+    // Erase each previous row, including its tail, before writing shorter content.
+    output.write(`\x1b[H${lines.map(line => `\x1b[2K${colorize(line)}`).join("\r\n")}\x1b[J`);
   };
   const addWarning = (level, message) => {
     recent.push(`${new Date().toLocaleTimeString()} [${level}] ${clean(message).slice(0, 16000)}`);
