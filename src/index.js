@@ -6,6 +6,8 @@ const { chatSettingsChanges } = require("./chat-settings");
 const { acquireInstanceGuard } = require("./instance-guard");
 const { listSubscriptions, summarizeSubscriptions } = require("./subscription-diagnostics");
 const { startDashboard } = require("./terminal-dashboard");
+const { SlackOutbox, sendSlackWebhook } = require("./slack-outbox");
+const { HealthAlerts } = require("./health-alerts");
 const diagnosticOnly = process.argv.includes("--diagnose");
 
 const EVENTSUB_WS_URL = "wss://eventsub.wss.twitch.tv/ws";
@@ -59,8 +61,21 @@ let diagnosticInFlight = null;
 let diagnosticReport = null;
 let diagnosticReportAt = null;
 let dashboard = null;
+let slackOutbox = null;
+let healthAlerts = null;
+let healthTimer = null;
+let diagnosticTimer = null;
 
-main().catch((error) => {
+main().catch(async (error) => {
+  clearInterval(healthTimer);
+  clearInterval(diagnosticTimer);
+  if (healthAlerts) {
+    try {
+      healthAlerts.set("Process startup", "起動処理に失敗しました。稼働環境のログを確認してください。", true);
+      await slackOutbox.flush();
+    } catch { log("error", "Failed to persist startup failure alert"); }
+    await slackOutbox.close().catch(() => {});
+  }
   log("fatal", error instanceof Error ? error.stack || error.message : String(error));
   if (dashboard) {
     dashboard.close();
@@ -76,6 +91,7 @@ async function main() {
       connection: !websocket ? "disconnected / reconnecting" : websocket.readyState === WebSocket.OPEN
         ? websocket.subscriptionsReady ? "connected" : "registering" : "connecting",
       report: diagnosticReport, reportAt: diagnosticReportAt,
+      slack: slackOutbox?.status(),
       broadcasters: resolvedBroadcasters.map(broadcaster => {
         const current = state.broadcasters[broadcaster.id];
         return { ...broadcaster, live: current?.live || false, title: current?.title || "", categoryName: current?.categoryName || "" };
@@ -88,6 +104,16 @@ async function main() {
     log("info", `Instance guard acquired: 127.0.0.1:${instanceGuard.port}`);
   }
   if (!diagnosticOnly) ensureStateDirectory(stateFile);
+  if (!diagnosticOnly) {
+    slackOutbox = new SlackOutbox(path.resolve(env.SLACK_OUTBOX_FILE || path.join(path.dirname(stateFile), "slack-outbox.json")), {
+      send: payload => sendSlackWebhook(config.slackWebhookUrl, payload), log,
+    });
+    healthAlerts = new HealthAlerts(slackOutbox, {
+      repeatMs: Number.isFinite(config.authAlertIntervalMs) ? Math.max(60000, config.authAlertIntervalMs) : 7200000,
+    });
+    slackOutbox.start();
+    healthTimer = setInterval(checkHealth, 15000);
+  }
   const initialState = diagnosticOnly ? state : loadState(stateFile, []);
   state.broadcasters = initialState.broadcasters;
   state.meta = initialState.meta;
@@ -110,6 +136,28 @@ async function main() {
   await cleanupManagedSubscriptions();
   await connect(EVENTSUB_WS_URL);
   startLiveReconcileLoop();
+  healthAlerts.set("Process startup", null);
+  diagnosticTimer = setInterval(() => {
+    diagnoseSubscriptions(websocket?.eventsubSessionId || null).catch(() => {
+      try { healthAlerts?.set("Subscription diagnostics", "購読状況の取得に失敗しています。--diagnoseで確認してください。"); }
+      catch { log("error", "Failed to persist subscription diagnostic alert"); }
+    });
+  }, 60000);
+}
+
+function checkHealth() {
+  if (!healthAlerts) return;
+  try {
+    const connected = websocket?.readyState === WebSocket.OPEN && websocket.subscriptionsReady;
+    healthAlerts.set("Twitch WebSocket", connected ? null : "EventSub接続が利用できません。APIの定期補完は継続します。");
+    if (connected && diagnosticReport?.currentSessionId === websocket.eventsubSessionId) {
+      const missing = diagnosticReport.coverage.filter(row => row.status !== "enabled");
+      healthAlerts.set("Twitch subscriptions", missing.length ? `未購読または別接続: ${missing.map(row => `${row.login}/${row.type}`).join(", ")}` : null);
+    }
+    const status = slackOutbox.status();
+    healthAlerts.set("Slack delivery", status.retrying || status.stopped ? `Slack送信に失敗しています。送信待ち: ${status.pending}件。Webhook設定とネットワークを確認してください。` : null);
+    healthAlerts.tick();
+  } catch { log("error", "Health alert persistence failed; check available disk space and outbox permissions"); }
 }
 
 async function connect(url, previousSocket = null) {
@@ -230,6 +278,7 @@ async function handleMessage(payload, socket = websocket, transferred = false) {
       return;
     case "revocation":
       log("warn", `Subscription revoked: ${payload.payload.subscription.type} (${payload.payload.subscription.status})`);
+      healthAlerts?.set("Twitch subscriptions", "EventSub購読が失効しました。--diagnoseで確認してください。", true);
       return;
     default:
       log("info", `Unhandled message type: ${messageType || "unknown"}`);
@@ -315,6 +364,7 @@ async function diagnoseSubscriptions(sessionId = null) {
     const report = summarizeSubscriptions(snapshot, resolvedBroadcasters, types, sessionId, chatUserId);
     diagnosticReport = report;
     diagnosticReportAt = new Date().toLocaleTimeString();
+    healthAlerts?.set("Subscription diagnostics", null);
     log("info", `EventSub diagnostics: cost=${report.totalCost ?? "unknown"}/${report.maxTotalCost ?? "unknown"} total=${report.total ?? "unknown"} enabledWebSockets=${report.enabledWebSockets} (API totals may lag)`);
     for (const row of report.subscriptions) log("info", `EventSub subscription: ${JSON.stringify(row)}`);
     for (const row of report.coverage) log(row.status === "enabled" ? "info" : "warn", `EventSub coverage: ${JSON.stringify(row)}`);
@@ -398,6 +448,7 @@ async function ensureValidUserAccessToken() {
   }
 
   if (!diagnosticOnly) clearAuthFailureNotice();
+  healthAlerts?.set("Twitch authentication", null);
   chatUserId = validation.data.scopes?.includes("user:read:chat") ? validation.data.user_id : null;
   if (!chatUserId) log("warn", "Chat mode notifications disabled: reauthorize token with user:read:chat scope");
   log("info", `Validated user token for ${validation.data.login}`);
@@ -456,6 +507,7 @@ async function refreshUserAccessToken() {
     saveEnvValue("TWITCH_REFRESH_TOKEN", token.refresh_token);
     clearAuthFailureNotice();
     log("info", "Refreshed Twitch user access token");
+    healthAlerts?.set("Twitch authentication", null);
   })();
 
   try {
@@ -630,7 +682,14 @@ async function reconcileLiveState() {
   if (config.liveReconcileLogMode === "verbose") {
     log("info", `Running live reconcile check for ${resolvedBroadcasters.length} broadcasters`);
   }
-  const streams = await fetchLiveStreamsByLogin(resolvedBroadcasters.map((b) => b.login));
+  let streams;
+  try {
+    streams = await fetchLiveStreamsByLogin(resolvedBroadcasters.map((b) => b.login));
+    healthAlerts?.set("Twitch API", null);
+  } catch (error) {
+    healthAlerts?.set("Twitch API", "配信状態のAPI補完に失敗しています。ネットワークと認証設定を確認してください。");
+    throw error;
+  }
   const streamsByLogin = new Map(streams.map((stream) => [stream.user_login, stream]));
   let changed = false;
   let reconciledOnline = 0;
@@ -853,16 +912,8 @@ async function handleChannelUpdate(event) {
   log("info", `Channel update notified: login=${broadcaster.login} title=${broadcaster.title || "(empty)"} category=${broadcaster.categoryName || "(empty)"} url=${streamUrl(broadcaster.login)}`);
 }
 async function postToSlack(payload) {
-  const response = await fetch(config.slackWebhookUrl, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(payload),
-  });
-
-  if (!response.ok) {
-    const text = await response.text();
-    throw new Error(`Slack webhook failed: ${response.status} ${text}`);
-  }
+  if (!slackOutbox) throw new Error("Slack outbox is not initialized");
+  slackOutbox.enqueue(payload);
 }
 
 function buildSlackPayload({ headlineText, plainLines, blockLines, iconUrl }) {
@@ -940,42 +991,8 @@ function saveEnvValue(key, value) {
   fs.writeFileSync(envFilePath, updated.join("\n"));
 }
 
-async function notifyAuthFailure(error) {
-  const now = Date.now();
-  const authState = state.meta.auth.refreshFailure;
-  const detail = error instanceof Error ? error.message : String(error);
-
-  if (authState.lastNotifiedAt && now - authState.lastNotifiedAt < config.authAlertIntervalMs) {
-    log("warn", `Auth failure notification suppressed: nextAllowedInMs=${config.authAlertIntervalMs - (now - authState.lastNotifiedAt)}`);
-    return;
-  }
-
-  authState.lastNotifiedAt = now;
-  authState.lastError = detail;
-  saveState(stateFile, state);
-
-  try {
-    await postToSlack({
-      ...buildSlackPayload({
-        headlineText: "Twitch auth refresh failed",
-        plainLines: [
-          "Twitch token refresh failed.",
-          `Time: ${new Date(now).toISOString()}`,
-          `Detail: ${detail}`,
-          `Next Notification After: ${new Date(now + config.authAlertIntervalMs).toISOString()}`,
-        ],
-        blockLines: [
-          "*Twitch token refresh failed.*",
-          `*Time*: ${escapeMrkdwn(new Date(now).toISOString())}`,
-          `*Detail*: ${escapeMrkdwn(detail)}`,
-          `*Next Notification After*: ${escapeMrkdwn(new Date(now + config.authAlertIntervalMs).toISOString())}`,
-        ],
-      }),
-    });
-    log("warn", `Auth failure notification sent: ${detail}`);
-  } catch (notifyError) {
-    log("error", `Failed to send auth failure notification: ${notifyError instanceof Error ? notifyError.message : String(notifyError)}`);
-  }
+async function notifyAuthFailure() {
+  healthAlerts?.set("Twitch authentication", "Twitch token refresh failed. Check the authentication settings and local logs.", true);
 }
 
 function clearAuthFailureNotice() {

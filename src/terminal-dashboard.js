@@ -35,6 +35,7 @@ function dashboardLines(snapshot, recent = [], { height = 24, width = 99 } = {})
     `Subscriptions: ${report ? `${enabled}/${coverage.length}` : "checking"}  Cost: ${report?.totalCost ?? "?"}/${report?.maxTotalCost ?? "?"}  Active sessions: ${report?.enabledWebSockets ?? "?"}`,
     "Cost and coverage reflect the last API check; totals may lag.",
     report ? `Last API check: ${snapshot.reportAt || "-"}` : "Waiting for subscription diagnostics...",
+    `Slack: pending=${snapshot.slack?.pending ?? "?"} retrying=${snapshot.slack?.retrying ?? "?"}${snapshot.slack?.stopped ? " [STOPPED]" : ""}`,
     "",
     channelRow("CHANNEL", "STREAM", "ONLINE", "UPDATE", "CHAT", "CATEGORY", "TITLE"),
     ...(snapshot.broadcasters || []).map(broadcaster => {
