@@ -9,6 +9,7 @@ const { startDashboard } = require("./terminal-dashboard");
 const { SlackOutbox, sendSlackWebhook } = require("./slack-outbox");
 const { HealthAlerts } = require("./health-alerts");
 const { FileLogger, redactLog } = require("./file-logger");
+const { readAutoCommentConfig, commentOnRelease } = require("./auto-comment");
 const diagnosticOnly = process.argv.includes("--diagnose");
 
 const EVENTSUB_WS_URL = "wss://eventsub.wss.twitch.tv/ws";
@@ -23,6 +24,7 @@ const WS_SETUP_TIMEOUT_MS = 30000;
 
 const env = loadEnv();
 const broadcasterLogins = parseBroadcasterLogins(env.TWITCH_BROADCASTERS);
+const autoCommentConfig = readAutoCommentConfig(env, broadcasterLogins.map(login => login.toLowerCase()));
 const stateFile = path.resolve(process.cwd(), env.STATE_FILE || "./data/state.json");
 
 if (!env.TWITCH_CLIENT_ID) throw new Error("TWITCH_CLIENT_ID is required.");
@@ -69,6 +71,9 @@ let diagnosticTimer = null;
 let chatReconcileTimer = null;
 let chatReconcileInFlight = false;
 let fileLogger = null;
+let chatSenderId = null;
+let chatCanWrite = false;
+const chatApiBaselines = new Set();
 const freshness = { startedAt: Date.now() };
 
 main().catch(async (error) => {
@@ -469,6 +474,9 @@ async function ensureValidUserAccessToken() {
   if (!diagnosticOnly) clearAuthFailureNotice();
   healthAlerts?.set("Twitch authentication", null);
   chatUserId = validation.data.scopes?.includes("user:read:chat") ? validation.data.user_id : null;
+  chatSenderId = validation.data.user_id;
+  chatCanWrite = Boolean(validation.data.scopes?.includes("user:write:chat"));
+  if (autoCommentConfig.enabled && !chatCanWrite) log("warn", "Auto-comment disabled: authorize user:write:chat scope; monitoring continues");
   if (!chatUserId) log("warn", "Chat mode realtime events disabled: reauthorize with user:read:chat; API polling remains active");
   log("info", `Validated user token for ${validation.data.login}`);
 }
@@ -834,6 +842,7 @@ async function reconcileChatSettings() {
 
 async function handleChatSettingsUpdate(event, source = "eventsub") {
   const broadcaster = ensureBroadcasterState(event);
+  const initialApiCheck = source === "api" && !chatApiBaselines.has(broadcaster.id);
   const previous = broadcaster.chatSettings;
   // First API sample establishes a baseline. An already-active emote mode is still reported.
   const changes = source === "api" && !previous
@@ -851,6 +860,33 @@ async function handleChatSettingsUpdate(event, source = "eventsub") {
   if (source === "eventsub" || !previous) log("info", `Chat settings received: source=${source} login=${broadcaster.login} emote_mode=${event.emote_mode}`);
   broadcaster.chatSettings = { ...event };
   saveState(stateFile, state);
+  if (source === "api") chatApiBaselines.add(broadcaster.id);
+  if (initialApiCheck) return;
+  try {
+    const result = await commentOnRelease({ config: autoCommentConfig, previous, current: broadcaster,
+      senderId: chatSenderId, canWrite: chatCanWrite, save: () => saveState(stateFile, state),
+      isLive: async () => {
+        const response = await twitchFetch(`${TWITCH_API_BASE_URL}/streams?user_id=${encodeURIComponent(broadcaster.id)}`,
+          { headers: twitchHeaders(), signal: AbortSignal.timeout(10000) }, { retryOnUnauthorized: true });
+        if (!response.ok) throw new Error(`Auto-comment live check failed: HTTP ${response.status}`);
+        return (await response.json()).data?.some(stream => stream.user_id === broadcaster.id) || false;
+      },
+      isShared: async () => {
+        const response = await twitchFetch(`${TWITCH_API_BASE_URL}/shared_chat/session?broadcaster_id=${encodeURIComponent(broadcaster.id)}`,
+          { headers: twitchHeaders(), signal: AbortSignal.timeout(10000) }, { retryOnUnauthorized: true });
+        if (!response.ok) throw new Error(`Auto-comment Shared Chat check failed: HTTP ${response.status}`);
+        const json = await response.json();
+        if (!Array.isArray(json.data)) throw new Error("Invalid Shared Chat response");
+        return json.data.length > 0;
+      },
+      send: body => twitchFetch(`${TWITCH_API_BASE_URL}/chat/messages`, {
+        method: "POST", headers: twitchHeaders(), body: JSON.stringify(body), signal: AbortSignal.timeout(10000),
+      }, { retryOnUnauthorized: false }),
+    });
+    if (result !== "not-triggered") log("info", `Auto-comment: login=${broadcaster.login} result=${result}`);
+  } catch (error) {
+    log("error", `Auto-comment failed: login=${broadcaster.login} ${error.message}`);
+  }
 }
 
 async function handleStreamOnline(event) {

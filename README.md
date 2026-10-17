@@ -185,6 +185,44 @@ Slack欄の `last sent` は最後に送信成功した時からの経過時間�
 保存済みの設定がある場合は、その設定との差分を通知します。
 30秒以内に開始・解除の両方が起きると、API補完だけでは途中の変更を検知できません。
 
+## スタンプ限定の解除時にTwitchチャットへ自動投稿
+
+既定では無効です。`.env` で対象チャンネルとコメントを指定して有効にできます。
+対象は `TWITCH_BROADCASTERS` にも含めてください。複数対象には同じコメントを投稿します。
+
+```env
+TWITCH_EMOTE_RELEASE_COMMENT_ENABLED=true
+TWITCH_EMOTE_RELEASE_COMMENT_CHANNELS=nikopyonzoku
+TWITCH_EMOTE_RELEASE_COMMENT_MESSAGE=こんにちは！
+TWITCH_EMOTE_RELEASE_COMMENT_ALLOW_OFFLINE=false
+TWITCH_EMOTE_RELEASE_COMMENT_COOLDOWN_MS=300000
+```
+
+- `ENABLED`：`true` で有効。`false` または省略で無効。
+- `CHANNELS`：対象のlogin名をカンマ区切りで指定。
+- `MESSAGE`：1〜500文字、改行なし。
+- `ALLOW_OFFLINE`：`false` は配信中だけ、`true` はオフラインでも投稿。
+- `COOLDOWN_MS`：同じチャンネルへの試行間隔。標準5分、最低1分。
+
+投稿者は認証したTwitchアカウントです。送信用の `user:write:chat` 権限も承認してください。
+
+```powershell
+./get-twitch-user-token.ps1 -ClientId "YOUR_TWITCH_CLIENT_ID" -Scopes "user:read:chat user:write:chat"
+```
+
+発行されたAccess TokenとRefresh Tokenを `.env` に設定して再起動します。
+送信権限がない場合は警告を出し、自動投稿を行わず監視を続けます。
+
+保存済みの設定が「有効」から「無効」へ変わった場合だけ投稿します。
+起動後最初のAPI確認では投稿せず、その後のWSまたはAPI補完による解除が対象です。
+配信中だけに設定した場合は、投稿直前に配信状態をAPI確認します。
+Twitchの共有チャットでは他チャンネルにも投稿されるため、共有チャット中の投稿はスキップします。
+同時受信や再起動による連投を抑えるため、送信試行時刻を先に保存し、失敗やタイムアウトの自動再送はしません。
+結果はINFOの `Auto-comment`、失敗はERRORの `Auto-comment failed` で確認できます。
+この機能はSlack通知とは独立しています。コードのテストでは実際のコメント投稿は行いません。
+
+参照：[Twitch Send Chat Message](https://dev.twitch.tv/docs/api/reference/#send-chat-message)
+
 ## Slack送信の再試行と異常アラート
 
 通知は送信前に `slack-outbox.json` に保存し、正常に送信できたものだけを削除します。
