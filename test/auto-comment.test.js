@@ -1,6 +1,6 @@
 const { test } = require("node:test");
 const assert = require("node:assert/strict");
-const { readAutoCommentConfig, commentOnRelease, commentOnStart } = require("../src/auto-comment");
+const { readAutoCommentConfig, commentOnRelease, commentOnStart, ReleaseCommentScheduler } = require("../src/auto-comment");
 
 function fixture() {
   const sent = [];
@@ -87,4 +87,48 @@ test("concurrent start detections cannot post twice and timeouts are not retried
   failure.send = async () => { throw new Error("timeout"); };
   await assert.rejects(commentOnStart(failure));
   assert.equal(await commentOnStart(failure), "already-attempted");
+});
+
+test("release delay is configurable and invalid delays are rejected", () => {
+  const env = { TWITCH_EMOTE_RELEASE_COMMENT_ENABLED: "true", TWITCH_EMOTE_RELEASE_COMMENT_CHANNELS: "target", TWITCH_EMOTE_RELEASE_COMMENT_MESSAGE: "hello", TWITCH_EMOTE_RELEASE_COMMENT_DELAY_MS: "15000" };
+  assert.equal(readAutoCommentConfig(env, ["target"]).delayMs, 15000);
+  for (const delay of ["-1", "NaN", "1.5", "86400001"]) assert.throws(() => readAutoCommentConfig({ ...env, TWITCH_EMOTE_RELEASE_COMMENT_DELAY_MS: delay }, ["target"]), /delay/);
+});
+
+test("release waiting is nonblocking and sends only when the delay expires", async () => {
+  const timers = [];
+  const scheduler = new ReleaseCommentScheduler({ setTimer: (fn, ms) => { timers.push({ fn, ms }); return 1; }, clearTimer() {} });
+  const f = fixture(); f.config.delayMs = 15000;
+  const done = new Promise((resolve, reject) => {
+    scheduler.request(f, (error, result) => error ? reject(error) : resolve(result));
+  });
+  assert.equal(f.sent.length, 0); assert.equal(timers[0].ms, 15000);
+  timers[0].fn(); assert.equal(await done, "sent"); assert.equal(f.sent.length, 1);
+});
+
+test("re-enabling cancels a pending release and a later release starts a new delay", async () => {
+  const timers = [];
+  const scheduler = new ReleaseCommentScheduler({ setTimer: (fn, ms) => { timers.push({ fn, ms }); return timers.length; }, clearTimer() {} });
+  const f = fixture(); f.config.delayMs = 10000;
+  assert.equal(await scheduler.request(f), "scheduled");
+  scheduler.cancel(f.current);
+  timers[0].fn(); await Promise.resolve(); assert.equal(f.sent.length, 0);
+  const done = new Promise(resolve => { scheduler.request(f, (error, result) => resolve(result)); });
+  timers[0].fn(); timers[1].fn(); assert.equal(await done, "sent"); assert.equal(f.sent.length, 1);
+});
+
+test("mode recheck prevents posting when emote-only was re-enabled while waiting", async () => {
+  const f = fixture(); f.isEmoteDisabled = async () => false;
+  assert.equal(await commentOnRelease(f), "mode-changed"); assert.equal(f.sent.length, 0);
+});
+
+test("cancellation during preflight prevents a delayed send", async () => {
+  let finish, fire;
+  const f = fixture(); f.config.delayMs = 10000;
+  f.isShared = () => new Promise(resolve => { finish = resolve; });
+  const scheduler = new ReleaseCommentScheduler({ setTimer: fn => { fire = fn; }, clearTimer() {} });
+  const done = new Promise(resolve => { scheduler.request(f, (error, result) => resolve(result)); });
+  fire(); await Promise.resolve(); await Promise.resolve();
+  scheduler.cancel(f.current); finish(false);
+  assert.equal(await done, "mode-changed"); assert.equal(f.sent.length, 0);
 });

@@ -11,6 +11,7 @@ function harness(request) {
     freshness: {},
     chatApiBaselines: new Set(), autoCommentConfig: { enabled: false }, chatSenderId: null, chatCanWrite: false,
     commentOnRelease: async () => "not-triggered",
+    releaseCommentScheduler: { cancel() {}, request: async () => "not-triggered" },
     state: { broadcasters: { "1": current } }, stateFile: "unused", resolvedBroadcasters: [current],
     TWITCH_API_BASE_URL: "https://api.twitch.tv/helix", AbortSignal,
     chatSettingsChanges, normalizeApiChatSettings, encodeURIComponent,
@@ -90,7 +91,7 @@ test("API duration field names are normalized to the EventSub schema", () => {
 test("the first API sample never triggers automatic posting from persisted state", async () => {
   const h = harness(async () => apiResponse(false));
   h.current.chatSettings = { emote_mode: true };
-  h.run('globalThis.commentCalls = 0; commentOnRelease = async () => { commentCalls++; return "not-triggered"; }');
+  h.run('globalThis.commentCalls = 0; releaseCommentScheduler.request = async () => { commentCalls++; return "not-triggered"; }');
   await h.run("reconcileChatSettings()");
   assert.equal(h.run("commentCalls"), 0);
   assert.equal(h.current.chatSettings.emote_mode, false);

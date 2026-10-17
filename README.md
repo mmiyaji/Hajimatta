@@ -215,6 +215,7 @@ WSによる配信開始、またはAPI補完によるオフライン→配信中
 TWITCH_EMOTE_RELEASE_COMMENT_ENABLED=true
 TWITCH_EMOTE_RELEASE_COMMENT_CHANNELS=nikopyonzoku
 TWITCH_EMOTE_RELEASE_COMMENT_MESSAGE=こんにちは！
+TWITCH_EMOTE_RELEASE_COMMENT_DELAY_MS=15000
 TWITCH_EMOTE_RELEASE_COMMENT_ALLOW_OFFLINE=false
 TWITCH_EMOTE_RELEASE_COMMENT_COOLDOWN_MS=300000
 ```
@@ -222,6 +223,7 @@ TWITCH_EMOTE_RELEASE_COMMENT_COOLDOWN_MS=300000
 - `ENABLED`：`true` で有効。`false` または省略で無効。
 - `CHANNELS`：対象のlogin名をカンマ区切りで指定。
 - `MESSAGE`：1〜500文字、改行なし。
+- `DELAY_MS`：解除を検知してから投稿までの待ち時間。`15000` は15秒。省略または `0` で即時、最大24時間。
 - `ALLOW_OFFLINE`：`false` は配信中だけ、`true` はオフラインでも投稿。
 - `COOLDOWN_MS`：同じチャンネルへの試行間隔。標準5分、最低1分。
 
@@ -239,6 +241,10 @@ TWITCH_EMOTE_RELEASE_COMMENT_COOLDOWN_MS=300000
 配信中だけに設定した場合は、投稿直前に配信状態をAPI確認します。
 Twitchの共有チャットでは他チャンネルにも投稿されるため、共有チャット中の投稿はスキップします。
 同時受信や再起動による連投を抑えるため、送信試行時刻を先に保存し、失敗やタイムアウトの自動再送はしません。
+待機中も監視は継続します。スタンプ限定の再有効化を検知した場合は待機を取り消し、
+次の解除を検知した時点から新たに待ちます。投稿直前にもAPIでスタンプ限定が解除済みか確認します。
+待機タイマーは再起動で取り消され、後から投稿し直しません。クールダウンは投稿試行時刻から数えます。
+待機の開始・完了はINFOの `Auto-comment delay` / `Delayed auto-comment` に記録します。
 結果はINFOの `Auto-comment`、失敗はERRORの `Auto-comment failed` で確認できます。
 この機能はSlack通知とは独立しています。コードのテストでは実際のコメント投稿は行いません。
 

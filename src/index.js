@@ -9,7 +9,7 @@ const { startDashboard } = require("./terminal-dashboard");
 const { SlackOutbox, sendSlackWebhook } = require("./slack-outbox");
 const { HealthAlerts } = require("./health-alerts");
 const { FileLogger, redactLog } = require("./file-logger");
-const { readAutoCommentConfig, commentOnRelease, commentOnStart } = require("./auto-comment");
+const { readAutoCommentConfig, commentOnStart, ReleaseCommentScheduler } = require("./auto-comment");
 const diagnosticOnly = process.argv.includes("--diagnose");
 
 const EVENTSUB_WS_URL = "wss://eventsub.wss.twitch.tv/ws";
@@ -75,6 +75,7 @@ let fileLogger = null;
 let chatSenderId = null;
 let chatCanWrite = false;
 const chatApiBaselines = new Set();
+const releaseCommentScheduler = new ReleaseCommentScheduler();
 const freshness = { startedAt: Date.now() };
 
 main().catch(async (error) => {
@@ -865,10 +866,16 @@ async function handleChatSettingsUpdate(event, source = "eventsub") {
   if (source === "eventsub" || !previous) log("info", `Chat settings received: source=${source} login=${broadcaster.login} emote_mode=${event.emote_mode}`);
   broadcaster.chatSettings = { ...event };
   saveState(stateFile, state);
+  if (event.emote_mode === true) releaseCommentScheduler.cancel(broadcaster);
   if (source === "api") chatApiBaselines.add(broadcaster.id);
   if (initialApiCheck) return;
   try {
-    const result = await commentOnRelease({ config: autoCommentConfig, previous, current: broadcaster, ...autoCommentTransport(broadcaster) });
+    const result = await releaseCommentScheduler.request({ config: autoCommentConfig, previous, current: broadcaster, ...autoCommentTransport(broadcaster) },
+      (error, result) => {
+        if (error) log("error", `Delayed auto-comment failed: login=${broadcaster.login} ${error.message}`);
+        else log("info", `Delayed auto-comment: login=${broadcaster.login} result=${result}`);
+      });
+    if (result === "scheduled") log("info", `Auto-comment delay: login=${broadcaster.login} waitMs=${autoCommentConfig.delayMs}`);
     if (result !== "not-triggered") log("info", `Auto-comment: login=${broadcaster.login} result=${result}`);
   } catch (error) {
     log("error", `Auto-comment failed: login=${broadcaster.login} ${error.message}`);
@@ -877,6 +884,14 @@ async function handleChatSettingsUpdate(event, source = "eventsub") {
 
 function autoCommentTransport(broadcaster, streamKey = null) {
   return { senderId: chatSenderId, canWrite: chatCanWrite, save: () => saveState(stateFile, state),
+      isEmoteDisabled: async () => {
+        const response = await twitchFetch(`${TWITCH_API_BASE_URL}/chat/settings?broadcaster_id=${encodeURIComponent(broadcaster.id)}`,
+          { headers: twitchHeaders(), signal: AbortSignal.timeout(10000) }, { retryOnUnauthorized: true });
+        if (!response.ok) throw new Error(`Auto-comment mode check failed: HTTP ${response.status}`);
+        const row = (await response.json()).data?.[0];
+        if (row?.broadcaster_id !== broadcaster.id || typeof row.emote_mode !== "boolean") throw new Error("Invalid chat mode check response");
+        return row.emote_mode === false;
+      },
       isLive: async () => {
         const response = await twitchFetch(`${TWITCH_API_BASE_URL}/streams?user_id=${encodeURIComponent(broadcaster.id)}`,
           { headers: twitchHeaders(), signal: AbortSignal.timeout(10000) }, { retryOnUnauthorized: true });
