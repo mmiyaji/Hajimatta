@@ -185,6 +185,27 @@ Slack欄の `last sent` は最後に送信成功した時からの経過時間�
 保存済みの設定がある場合は、その設定との差分を通知します。
 30秒以内に開始・解除の両方が起きると、API補完だけでは途中の変更を検知できません。
 
+## 配信開始時にTwitchチャットへ自動投稿
+
+スタンプ限定解除とは別に有効・無効、対象チャンネル、本文を設定できます。
+対象のlogin名はカンマ区切りで複数指定でき、`TWITCH_BROADCASTERS` にも含めてください。
+指定した全チャンネルに同じ本文を使用します。監視対象全体の上限は従来どおり5チャンネルです。
+
+```env
+TWITCH_BROADCASTERS=channel_one,channel_two
+TWITCH_STREAM_START_COMMENT_ENABLED=true
+TWITCH_STREAM_START_COMMENT_CHANNELS=channel_one,channel_two
+TWITCH_STREAM_START_COMMENT_MESSAGE=配信開始おめでとうございます！
+TWITCH_STREAM_START_COMMENT_COOLDOWN_MS=300000
+```
+
+WSによる配信開始、またはAPI補完によるオフライン→配信中の検知で投稿します。
+起動時点で配信中のチャンネルには投稿しません。同じ配信への投稿試行を保存して二重投稿を防ぎます。
+標準のクールダウンは5分（最低1分）で、解除時コメントとは独立しています。
+既定では無効です。`user:write:chat` 権限、共有チャット中のスキップ、失敗時に自動再送しない扱いは
+下記の解除時コメントと共通です。投稿前に配信APIで対象の配信が継続中か確認します。
+本文はダブルクオートで囲まずに記載してください。
+
 ## スタンプ限定の解除時にTwitchチャットへ自動投稿
 
 既定では無効です。`.env` で対象チャンネルとコメントを指定して有効にできます。

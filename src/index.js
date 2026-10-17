@@ -9,7 +9,7 @@ const { startDashboard } = require("./terminal-dashboard");
 const { SlackOutbox, sendSlackWebhook } = require("./slack-outbox");
 const { HealthAlerts } = require("./health-alerts");
 const { FileLogger, redactLog } = require("./file-logger");
-const { readAutoCommentConfig, commentOnRelease } = require("./auto-comment");
+const { readAutoCommentConfig, commentOnRelease, commentOnStart } = require("./auto-comment");
 const diagnosticOnly = process.argv.includes("--diagnose");
 
 const EVENTSUB_WS_URL = "wss://eventsub.wss.twitch.tv/ws";
@@ -25,6 +25,7 @@ const WS_SETUP_TIMEOUT_MS = 30000;
 const env = loadEnv();
 const broadcasterLogins = parseBroadcasterLogins(env.TWITCH_BROADCASTERS);
 const autoCommentConfig = readAutoCommentConfig(env, broadcasterLogins.map(login => login.toLowerCase()));
+const startCommentConfig = readAutoCommentConfig(env, broadcasterLogins.map(login => login.toLowerCase()), "TWITCH_STREAM_START_COMMENT");
 const stateFile = path.resolve(process.cwd(), env.STATE_FILE || "./data/state.json");
 
 if (!env.TWITCH_CLIENT_ID) throw new Error("TWITCH_CLIENT_ID is required.");
@@ -476,7 +477,7 @@ async function ensureValidUserAccessToken() {
   chatUserId = validation.data.scopes?.includes("user:read:chat") ? validation.data.user_id : null;
   chatSenderId = validation.data.user_id;
   chatCanWrite = Boolean(validation.data.scopes?.includes("user:write:chat"));
-  if (autoCommentConfig.enabled && !chatCanWrite) log("warn", "Auto-comment disabled: authorize user:write:chat scope; monitoring continues");
+  if ((autoCommentConfig.enabled || startCommentConfig.enabled) && !chatCanWrite) log("warn", "Auto-comment disabled: authorize user:write:chat scope; monitoring continues");
   if (!chatUserId) log("warn", "Chat mode realtime events disabled: reauthorize with user:read:chat; API polling remains active");
   log("info", `Validated user token for ${validation.data.login}`);
 }
@@ -687,6 +688,9 @@ async function hydrateInitialState() {
     }
 
     if (nextLive) {
+      current.startCommentStreamKey = liveStream.id || nextStartedAt;
+      state.broadcasters[broadcaster.id] = current;
+      changed = true;
       liveCount += 1;
       liveSummaries.push(`login=${broadcaster.login} title=${nextTitle || "(empty)"} category=${nextCategoryName || "(empty)"} url=${streamUrl(broadcaster.login)}`);
     }
@@ -759,6 +763,7 @@ async function reconcileLiveState() {
         });
       }
       log("info", `Live state reconciled online: login=${broadcaster.login} startedAt=${current.startedAt || "(unknown)"} url=${streamUrl(broadcaster.login)}`);
+      await handleStartComment(current, liveStream.id || current.startedAt);
       continue;
     }
 
@@ -863,13 +868,21 @@ async function handleChatSettingsUpdate(event, source = "eventsub") {
   if (source === "api") chatApiBaselines.add(broadcaster.id);
   if (initialApiCheck) return;
   try {
-    const result = await commentOnRelease({ config: autoCommentConfig, previous, current: broadcaster,
-      senderId: chatSenderId, canWrite: chatCanWrite, save: () => saveState(stateFile, state),
+    const result = await commentOnRelease({ config: autoCommentConfig, previous, current: broadcaster, ...autoCommentTransport(broadcaster) });
+    if (result !== "not-triggered") log("info", `Auto-comment: login=${broadcaster.login} result=${result}`);
+  } catch (error) {
+    log("error", `Auto-comment failed: login=${broadcaster.login} ${error.message}`);
+  }
+}
+
+function autoCommentTransport(broadcaster, streamKey = null) {
+  return { senderId: chatSenderId, canWrite: chatCanWrite, save: () => saveState(stateFile, state),
       isLive: async () => {
         const response = await twitchFetch(`${TWITCH_API_BASE_URL}/streams?user_id=${encodeURIComponent(broadcaster.id)}`,
           { headers: twitchHeaders(), signal: AbortSignal.timeout(10000) }, { retryOnUnauthorized: true });
         if (!response.ok) throw new Error(`Auto-comment live check failed: HTTP ${response.status}`);
-        return (await response.json()).data?.some(stream => stream.user_id === broadcaster.id) || false;
+        return (await response.json()).data?.some(stream => stream.user_id === broadcaster.id
+          && (!streamKey || stream.id === streamKey || stream.started_at === streamKey)) || false;
       },
       isShared: async () => {
         const response = await twitchFetch(`${TWITCH_API_BASE_URL}/shared_chat/session?broadcaster_id=${encodeURIComponent(broadcaster.id)}`,
@@ -882,11 +895,15 @@ async function handleChatSettingsUpdate(event, source = "eventsub") {
       send: body => twitchFetch(`${TWITCH_API_BASE_URL}/chat/messages`, {
         method: "POST", headers: twitchHeaders(), body: JSON.stringify(body), signal: AbortSignal.timeout(10000),
       }, { retryOnUnauthorized: false }),
-    });
-    if (result !== "not-triggered") log("info", `Auto-comment: login=${broadcaster.login} result=${result}`);
-  } catch (error) {
-    log("error", `Auto-comment failed: login=${broadcaster.login} ${error.message}`);
-  }
+  };
+}
+
+async function handleStartComment(broadcaster, streamKey) {
+  if (!startCommentConfig.enabled) return;
+  try {
+    const result = await commentOnStart({ config: startCommentConfig, current: broadcaster, streamKey, ...autoCommentTransport(broadcaster, streamKey) });
+    if (result !== "not-triggered") log("info", `Start auto-comment: login=${broadcaster.login} result=${result}`);
+  } catch (error) { log("error", `Start auto-comment failed: login=${broadcaster.login} ${error.message}`); }
 }
 
 async function handleStreamOnline(event) {
@@ -915,6 +932,7 @@ async function handleStreamOnline(event) {
   });
 
   log("info", `Stream online detected: login=${broadcaster.login} title=${broadcaster.title || "(unknown)"} category=${broadcaster.categoryName || "(unknown)"} url=${streamUrl(broadcaster.login)}`);
+  await handleStartComment(broadcaster, event.id || broadcaster.startedAt);
 }
 
 async function handleChannelUpdate(event) {

@@ -1,6 +1,6 @@
 const { test } = require("node:test");
 const assert = require("node:assert/strict");
-const { readAutoCommentConfig, commentOnRelease } = require("../src/auto-comment");
+const { readAutoCommentConfig, commentOnRelease, commentOnStart } = require("../src/auto-comment");
 
 function fixture() {
   const sent = [];
@@ -45,4 +45,46 @@ test("dropped messages and network ambiguity are failures without automatic retr
     const f = fixture(); f.send = send; await assert.rejects(commentOnRelease(f));
     assert.equal(await commentOnRelease(f), "cooldown");
   }
+});
+
+test("start comment configuration accepts multiple monitored channels independently", () => {
+  const config = readAutoCommentConfig({ TWITCH_STREAM_START_COMMENT_ENABLED: "true",
+    TWITCH_STREAM_START_COMMENT_CHANNELS: "first,second,FIRST", TWITCH_STREAM_START_COMMENT_MESSAGE: "hello" }, ["first", "second"], "TWITCH_STREAM_START_COMMENT");
+  assert.deepEqual(config.channels, ["first", "second"]);
+  assert.equal(config.message, "hello");
+});
+
+test("start posts once per stream across WS/API duplicates and restart", async () => {
+  const f = fixture(); f.current.live = true; f.current.startedAt = "2026-10-17T10:00:00Z"; f.streamKey = "stream-1";
+  assert.equal(await commentOnStart(f), "sent");
+  assert.equal(await commentOnStart(f), "already-attempted");
+  const restarted = { ...f, current: JSON.parse(JSON.stringify(f.current)) };
+  assert.equal(await commentOnStart(restarted), "already-attempted");
+  assert.equal(f.sent.length, 1);
+});
+
+test("each configured channel can post on its own stream start", async () => {
+  const f = fixture(); f.config.channels = ["target", "other"];
+  f.current.live = true; f.streamKey = "one";
+  assert.equal(await commentOnStart(f), "sent");
+  f.current = { id: "2", login: "other", live: true }; f.streamKey = "two";
+  assert.equal(await commentOnStart(f), "sent");
+  assert.deepEqual(f.sent.map(body => body.broadcaster_id), ["1", "2"]);
+});
+
+test("start comments skip offline, shared chat and missing permissions", async () => {
+  for (const [patch, expected] of [[{ isLive: async () => false }, "offline"], [{ isShared: async () => true }, "shared-chat"], [{ canWrite: false }, "missing-scope"]]) {
+    const f = fixture(); f.current.live = true; f.streamKey = "one"; Object.assign(f, patch);
+    assert.equal(await commentOnStart(f), expected); assert.equal(f.sent.length, 0);
+  }
+});
+
+test("concurrent start detections cannot post twice and timeouts are not retried", async () => {
+  const f = fixture(); f.current.live = true; f.streamKey = "one";
+  await Promise.all([commentOnStart(f), commentOnStart(f)]);
+  assert.equal(f.sent.length, 1);
+  const failure = fixture(); failure.current.live = true; failure.streamKey = "two";
+  failure.send = async () => { throw new Error("timeout"); };
+  await assert.rejects(commentOnStart(failure));
+  assert.equal(await commentOnStart(failure), "already-attempted");
 });

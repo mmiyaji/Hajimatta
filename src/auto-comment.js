@@ -1,10 +1,10 @@
-function readAutoCommentConfig(env, monitored) {
-  const enabled = env.TWITCH_EMOTE_RELEASE_COMMENT_ENABLED === "true";
+function readAutoCommentConfig(env, monitored, prefix = "TWITCH_EMOTE_RELEASE_COMMENT") {
+  const enabled = env[`${prefix}_ENABLED`] === "true";
   if (!enabled) return { enabled: false };
-  const channels = [...new Set((env.TWITCH_EMOTE_RELEASE_COMMENT_CHANNELS || "").split(",").map(value => value.trim().toLowerCase()).filter(Boolean))];
-  const message = (env.TWITCH_EMOTE_RELEASE_COMMENT_MESSAGE || "").trim();
-  const cooldownMs = Number(env.TWITCH_EMOTE_RELEASE_COMMENT_COOLDOWN_MS || 300000);
-  const offline = env.TWITCH_EMOTE_RELEASE_COMMENT_ALLOW_OFFLINE || "false";
+  const channels = [...new Set((env[`${prefix}_CHANNELS`] || "").split(",").map(value => value.trim().toLowerCase()).filter(Boolean))];
+  const message = (env[`${prefix}_MESSAGE`] || "").trim();
+  const cooldownMs = Number(env[`${prefix}_COOLDOWN_MS`] || 300000);
+  const offline = env[`${prefix}_ALLOW_OFFLINE`] || "false";
   if (!channels.length || channels.some(login => !monitored.includes(login))) throw new Error("Auto-comment channels must be included in TWITCH_BROADCASTERS");
   if (!message || [...message].length > 500 || /[\r\n]/.test(message)) throw new Error("Auto-comment message must be a single line of 1–500 characters");
   if (!["true", "false"].includes(offline) || !Number.isFinite(cooldownMs) || cooldownMs < 60000) throw new Error("Invalid auto-comment offline flag or cooldown (minimum 60000 ms)");
@@ -31,4 +31,24 @@ async function commentOnRelease({ config, previous, current, senderId, canWrite,
   return "sent";
 }
 
-module.exports = { readAutoCommentConfig, commentOnRelease };
+async function commentOnStart({ config, current, streamKey, senderId, canWrite, isLive, isShared, send, save, now = Date.now }) {
+  if (!config.enabled || !config.channels.includes(current.login?.toLowerCase()) || !streamKey || !current.live) return "not-triggered";
+  if (!senderId || !canWrite) return "missing-scope";
+  const startedAt = current.startedAt;
+  const duplicate = () => current.startCommentStreamKey === streamKey;
+  if (duplicate()) return "already-attempted";
+  if (!await isLive()) return "offline";
+  if (await isShared()) return "shared-chat";
+  if (!current.live || current.startedAt !== startedAt) return "stream-changed";
+  if (duplicate()) return "already-attempted";
+  if (current.startCommentLastAttemptAt && now() - current.startCommentLastAttemptAt < config.cooldownMs) return "cooldown";
+  current.startCommentStreamKey = streamKey;
+  current.startCommentLastAttemptAt = now(); save();
+  const response = await send({ broadcaster_id: current.id, sender_id: senderId, message: config.message });
+  if (!response.ok) throw new Error(`Twitch chat send failed: HTTP ${response.status}`);
+  const result = (await response.json()).data?.[0];
+  if (result?.is_sent !== true) throw new Error(`Twitch chat message not sent: ${result?.drop_reason?.code || "unknown"}`);
+  return "sent";
+}
+
+module.exports = { readAutoCommentConfig, commentOnRelease, commentOnStart };

@@ -19,3 +19,17 @@ test("startup preserves an observed end but does not invent one for a missed tra
     assert.equal(broadcaster.lastOfflineAt, live ? null : ended);
   }
 });
+
+test("startup records ongoing stream as a baseline to prevent start comments", async () => {
+  const source = fs.readFileSync(require.resolve("../src/index.js"), "utf8");
+  const broadcaster = { id: "1", login: "channel", live: false };
+  const context = vm.createContext({ state: { broadcasters: { "1": broadcaster } }, stateFile: "unused",
+    resolvedBroadcasters: [{ id: "1", login: "channel" }], freshness: {},
+    fetchLiveStreamsByLogin: async () => [{ id: "ongoing", user_login: "channel", started_at: "2026-10-17T10:00:00Z" }],
+    fetchChannelInformationById: async () => [], saveState() {}, log() {}, streamUrl: () => "channel-url",
+  });
+  vm.runInContext(source.slice(source.indexOf("async function hydrateInitialState("), source.indexOf("function startLiveReconcileLoop(")), context);
+  await vm.runInContext("hydrateInitialState()", context);
+  assert.equal(broadcaster.startCommentStreamKey, "ongoing");
+  assert.equal(broadcaster.live, true);
+});
