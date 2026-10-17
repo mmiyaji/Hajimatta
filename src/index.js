@@ -45,9 +45,16 @@ const config = {
   slackMessageMode: env.SLACK_MESSAGE_MODE || "aligned",
   liveReconcileLogMode: env.LIVE_RECONCILE_LOG_MODE || "changes",
   reconnectDelayMs: 5000,
+  periodicReconnectIntervalMs: Number(env.TWITCH_WS_PERIODIC_RECONNECT_INTERVAL_MS || 0),
   liveReconcileIntervalMs: Number.parseInt(env.LIVE_RECONCILE_INTERVAL_MS || "120000", 10),
   authAlertIntervalMs: Number.parseInt(env.TWITCH_AUTH_ALERT_INTERVAL_MS || "7200000", 10),
 };
+
+if (!Number.isInteger(config.periodicReconnectIntervalMs) || config.periodicReconnectIntervalMs < 0
+  || config.periodicReconnectIntervalMs > 2147483647
+  || (config.periodicReconnectIntervalMs > 0 && config.periodicReconnectIntervalMs < 60000)) {
+  throw new Error("TWITCH_WS_PERIODIC_RECONNECT_INTERVAL_MS must be 0 (disabled) or 60000–2147483647 ms");
+}
 
 const state = { broadcasters: {}, meta: seedStateMeta() };
 const seenMessageIds = new Set();
@@ -147,6 +154,7 @@ async function main() {
   state.broadcasters = hydratedState.broadcasters;
   state.meta = hydratedState.meta;
   log("info", `Resolved ${resolvedBroadcasters.length} broadcasters`);
+  log("info", `Periodic WebSocket reconnect: ${config.periodicReconnectIntervalMs ? `${config.periodicReconnectIntervalMs} ms` : "disabled"}`);
   if (diagnosticOnly) {
     await diagnoseSubscriptions();
     return;
@@ -185,6 +193,7 @@ function checkHealth() {
 }
 
 async function connect(url, previousSocket = null) {
+  clearTimeout(websocket?.periodicReconnectTimer);
   clearTimeout(reconnectTimer);
   reconnectTimer = null;
 
@@ -198,6 +207,7 @@ async function connect(url, previousSocket = null) {
     log("warn", reason);
     clearTimeout(setupTimer);
     clearTimeout(socket.subscriptionRetryTimer);
+    clearTimeout(socket.periodicReconnectTimer);
     clearKeepaliveTimer();
     websocket = null;
     socket.terminate();
@@ -235,6 +245,14 @@ async function connect(url, previousSocket = null) {
         if (socket !== websocket) return;
         clearTimeout(setupTimer);
         log("info", "EventSub session setup completed (see subscription status above)");
+        if (config.periodicReconnectIntervalMs) {
+          socket.periodicReconnectTimer = setTimeout(() => {
+            if (socket !== websocket) return;
+            log("info", "Periodic reconnect interval reached; closing socket");
+            socket.terminate();
+          }, config.periodicReconnectIntervalMs);
+          socket.periodicReconnectTimer?.unref?.();
+        }
       } else {
         await handleMessage(payload, socket);
       }
@@ -248,6 +266,7 @@ async function connect(url, previousSocket = null) {
   socket.on("close", (code, reason) => {
     clearTimeout(setupTimer);
     clearTimeout(socket.subscriptionRetryTimer);
+    clearTimeout(socket.periodicReconnectTimer);
     if (socket !== websocket) return;
     log("warn", `WebSocket closed: code=${code} reason=${String(reason) || "(none)"}`);
     clearKeepaliveTimer();

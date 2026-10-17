@@ -50,6 +50,30 @@ test("stalled connection or welcome is terminated and retried", async () => {
   }
 });
 
+test("periodic reconnect is disabled by default without disabling failure recovery", async () => {
+  const h = harness(); await h.run('connect("normal")');
+  await h.sockets[0].message("session_welcome");
+  assert.equal(h.sockets[0].periodicReconnectTimer, undefined);
+  h.sockets[0].terminate();
+  assert.equal([...h.timers].some(t => t.ms === 5000), true);
+});
+
+test("optional periodic reconnect starts after setup and resets on transfer", async () => {
+  const h = harness(); h.run("config.periodicReconnectIntervalMs = 3600000");
+  await h.run('connect("normal")');
+  assert.equal([...h.timers].some(t => t.ms === 3600000), false);
+  await h.sockets[0].message("session_welcome");
+  const first = h.sockets[0].periodicReconnectTimer;
+  assert.equal(h.timers.has(first), true);
+  await h.run('reconnectTo("transfer")');
+  assert.equal(h.timers.has(first), false);
+  first.fn(); assert.equal(h.sockets[1].terminated, undefined);
+  await h.sockets[1].message("session_welcome", null);
+  h.sockets[1].periodicReconnectTimer.fn();
+  assert.equal(h.sockets[1].terminated, true);
+  assert.equal([...h.timers].some(t => t.ms === 5000), true);
+});
+
 test("socket error retries even without a subsequent close event", async () => {
   const h = harness(); await h.run('connect("normal")');
   h.sockets[0].terminate = () => {};
