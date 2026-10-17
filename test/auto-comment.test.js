@@ -12,6 +12,33 @@ function fixture() {
   };
 }
 
+test("message candidates override the single message and validate every candidate", () => {
+  for (const prefix of ["TWITCH_EMOTE_RELEASE_COMMENT", "TWITCH_STREAM_START_COMMENT"]) {
+    const env = { [`${prefix}_ENABLED`]: "true", [`${prefix}_CHANNELS`]: "target", [`${prefix}_MESSAGE`]: "fallback", [`${prefix}_MESSAGES`]: '[" first ","こんにちは,世界"]' };
+    assert.deepEqual(readAutoCommentConfig(env, ["target"], prefix).messages, ["first", "こんにちは,世界"]);
+    for (const invalid of ['[]', '{}', 'null', '[1]', '[" "]', '["ok",""]', '["line\\nbreak"]', JSON.stringify(["x".repeat(501)]), 'broken']) {
+      assert.throws(() => readAutoCommentConfig({ ...env, [`${prefix}_MESSAGES`]: invalid }, ["target"], prefix));
+    }
+    env[`${prefix}_MESSAGES`] = "";
+    assert.deepEqual(readAutoCommentConfig(env, ["target"], prefix).messages, ["fallback"]);
+    env[`${prefix}_MESSAGE`] = ""; env[`${prefix}_MESSAGES`] = '["candidate"]';
+    assert.deepEqual(readAutoCommentConfig(env, ["target"], prefix).messages, ["candidate"]);
+  }
+});
+
+test("release and start select a candidate at send time and skip random selection when suppressed", async () => {
+  for (const post of [commentOnRelease, commentOnStart]) {
+    for (const [randomValue, expected] of [[0, "first"], [0.5, "second"], [0.99999, "third"]]) {
+      const f = fixture(); f.current.live = true; f.streamKey = "stream";
+      f.config.messages = ["first", "second", "third"]; f.random = () => randomValue;
+      assert.equal(await post(f), "sent"); assert.equal(f.sent[0].message, expected);
+    }
+    const f = fixture(); f.current.live = true; f.streamKey = "stream"; f.canWrite = false;
+    f.random = () => { throw new Error("must not select"); };
+    assert.equal(await post(f), "missing-scope");
+  }
+});
+
 test("feature defaults off and validates explicit channel/message settings", () => {
   assert.equal(readAutoCommentConfig({}, []).enabled, false);
   const env = { TWITCH_EMOTE_RELEASE_COMMENT_ENABLED: "true", TWITCH_EMOTE_RELEASE_COMMENT_CHANNELS: "target", TWITCH_EMOTE_RELEASE_COMMENT_MESSAGE: "hello" };
